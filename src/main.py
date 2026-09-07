@@ -79,10 +79,6 @@ class RMSNorm:
         grid = (x.shape[0], 1, 1)
         block = (self.threads_per_row, 1, 1)
 
-        copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
-            x.element_type,
-        )
         thr_layout = cute.make_layout(
             (1, self.threads_per_row), stride=(self.threads_per_row, 1)
         )
@@ -90,13 +86,22 @@ class RMSNorm:
             (1, self.elements_per_thread), stride=(self.elements_per_thread, 1)
         )
 
-        tiled_copy = cute.make_tiled_copy_tv(
-            copy_atom, thr_layout=thr_layout, val_layout=val_layout
+        tiled_copy_g2r = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), x.element_type),
+            thr_layout=thr_layout,
+            val_layout=val_layout,
+        )
+        tiled_copy_g2s = cute.make_tiled_copy_tv(
+            cute.make_copy_atom(
+                cute.nvgpu.cpasync.CopyG2SOp(), x.element_type, num_bits_per_copy=128
+            ),
+            thr_layout=thr_layout,
+            val_layout=val_layout,
         )
 
-        self.rms_norm_kernel(x, weight, eps, out, tiled_copy).launch(
-            grid=grid, block=block, stream=stream
-        )
+        self.rms_norm_kernel(
+            x, weight, eps, out, tiled_copy_g2r, tiled_copy_g2s
+        ).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
     def rms_norm_kernel(
@@ -105,7 +110,8 @@ class RMSNorm:
         mW: cute.Tensor,
         eps: cute.Float32,
         mO: cute.Tensor,
-        tiled_copy: cute.TiledCopy,
+        tiled_copy_g2r: cute.TiledCopy,
+        tiled_copy_g2s: cute.TiledCopy,
     ) -> None:
         salloc = SmemAllocator()
 
@@ -115,8 +121,6 @@ class RMSNorm:
         warp_idx = cute.arch.warp_idx()
         num_warps = self.threads_per_row // cute.arch.WARP_SIZE
 
-        
-
         tiler_mn = (1, mX.shape[1])
 
         gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
@@ -125,20 +129,39 @@ class RMSNorm:
             mW.iterator, cute.make_layout((1, mW.shape[0]), stride=(0, mW.stride[0]))
         )
 
-        thr_copy = tiled_copy.get_slice(tidx)
+        gXsX = salloc.allocate_tensor(
+            mX.element_type,
+            cute.make_layout((1, mX.shape[1]), stride=(mX.shape[1], 1)),
+            byte_alignment=16,
+        )
 
-        tXgX = thr_copy.partition_S(gX)
-        tWgW = thr_copy.partition_S(gW)
-        tOgO = thr_copy.partition_D(gO)
+        thr_g2r = tiled_copy_g2r.get_slice(tidx)
+        thr_g2s = tiled_copy_g2s.get_slice(tidx)
 
-        rX = cute.make_rmem_tensor_like(tXgX)
+        tWgW = thr_g2r.partition_S(gW)
+        tOgO = thr_g2r.partition_D(gO)
+
+        tXgX = thr_g2s.partition_S(gX)
+        tXsX = thr_g2s.partition_D(gXsX)
+
+        tCsX = thr_g2r.partition_S(gXsX)
+
+        rX = cute.make_rmem_tensor_like(tCsX)
         rW = cute.make_rmem_tensor_like(tWgW)
         rO = cute.make_rmem_tensor_like(tOgO)
 
         thread_sum = cute.Float32(0.0)
 
-        cute.copy(tiled_copy, tXgX, rX)
-        cute.copy(tiled_copy, tWgW, rW)
+        cute.copy(tiled_copy_g2s, tXgX, tXsX)
+        cute.arch.cp_async_commit_group()
+
+        cute.copy(tiled_copy_g2r, tWgW, rW)
+
+        cute.arch.cp_async_wait_group(0)
+
+        cute.autovec_copy(tCsX, rX)
+
+        cute.arch.sync_threads()
 
         x_chunk = rX.load().to(cute.Float32)
         thread_sum += (x_chunk * x_chunk).reduce(
@@ -175,7 +198,7 @@ class RMSNorm:
         result = x_chunk * tXsX[0] * rW.load().to(cute.Float32)
         rO.store(result.to(rO.element_type))
 
-        cute.copy(tiled_copy, rO, tOgO)
+        cute.copy(tiled_copy_g2r, rO, tOgO)
 
 
 if __name__ == "__main__":
