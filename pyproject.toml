@@ -1,0 +1,20 @@
+[project]
+name = "cutie"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "nvidia-cutlass-dsl>=4.6.1",
+    "torch==2.12.1",
+]
+
+[project.scripts]
+cutie = "cutie:main"
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu129"
+
+[build-system]
+requires = ["uv_build>=0.12.1,<0.13.0"]
+build-backend = "uv_build"
