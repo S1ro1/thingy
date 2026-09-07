@@ -1,0 +1,9 @@
+M: 1024, H: 1024, Correctness: ✅, Baseline: 34.21 % vs Cutie: 31.28 %, Speedup: 0.91x
+M: 1024, H: 3072, Correctness: ✅, Baseline: 54.34 % vs Cutie: 50.39 %, Speedup: 0.93x
+M: 1024, H: 7168, Correctness: ✅, Baseline: 68.56 % vs Cutie: 60.34 %, Speedup: 0.88x
+M: 4096, H: 1024, Correctness: ✅, Baseline: 60.73 % vs Cutie: 60.78 %, Speedup: 1.00x
+M: 4096, H: 3072, Correctness: ✅, Baseline: 77.12 % vs Cutie: 73.57 %, Speedup: 0.95x
+M: 4096, H: 7168, Correctness: ✅, Baseline: 77.75 % vs Cutie: 78.25 %, Speedup: 1.01x
+M: 16384, H: 1024, Correctness: ✅, Baseline: 87.45 % vs Cutie: 76.53 %, Speedup: 0.88x
+M: 16384, H: 3072, Correctness: ✅, Baseline: 81.92 % vs Cutie: 82.65 %, Speedup: 1.01x
+M: 16384, H: 7168, Correctness: ✅, Baseline: 85.41 % vs Cutie: 84.64 %, Speedup: 0.99x
