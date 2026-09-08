@@ -17,6 +17,7 @@ No CUDA graphs or backward pass.
 
 import argparse
 import functools
+from dataclasses import dataclass
 
 import cuda.bindings.driver as cuda_driver
 import torch
@@ -28,6 +29,15 @@ from cutie.vendor.prime_rl.fp8_utils import per_token_cast_to_fp8_triton
 from rms_norm import RMSNorm
 
 GROUP_SIZE = 128
+
+
+@dataclass(frozen=True, unsafe_hash=True)
+class Config:
+    elements_per_thread: int
+    threads_per_row: int
+    load_path: str
+    reduction: str
+
 
 test_configs = [
     (1024, 3072),
@@ -147,7 +157,7 @@ def parse_args():
     parser.add_argument("--M", type=int)
     parser.add_argument("--H", type=int)
     parser.add_argument("--eps", type=float, default=1e-6)
-    parser.add_argument("--elements_per_thread", type=int, default=8)
+    parser.add_argument("--elements_per_thread", type=int, choices=(4, 8), default=8)
     parser.add_argument("--threads_per_row", type=int, default=128)
     parser.add_argument("--load-path", choices=("shared", "direct"), default="shared")
     parser.add_argument("--reduction", choices=("warp0", "all"), default="all")
@@ -155,6 +165,7 @@ def parse_args():
     parser.add_argument("--iterations", type=int, default=200)
     parser.add_argument("--workspace-count", type=int, default=16)
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--find-config", action="store_true")
     args = parser.parse_args()
     if (args.M is None) != (args.H is None):
         parser.error("Pass --M and --H together, or omit both to run all test shapes")
@@ -167,6 +178,8 @@ def parse_args():
         or args.workspace_count < 1
     ):
         parser.error("eps, warmup, iterations, and workspace-count must be positive")
+    if not 32 <= args.threads_per_row <= 1024 or args.threads_per_row % 32:
+        parser.error("threads_per_row must be a multiple of 32 between 32 and 1024")
     return args
 
 
@@ -176,113 +189,178 @@ def main():
     torch.manual_seed(args.seed)
     shapes = [(args.M, args.H)] if args.M is not None else test_configs
 
-    norm = RMSNorm(
-        elements_per_thread=args.elements_per_thread,
-        threads_per_row=args.threads_per_row,
-        load_path=args.load_path,
-        reduction=args.reduction,
-    )
     # Keep the current stream and non-graph timing requested for this harness.
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
 
     for M, H in shapes:
-        test_input = workspace_generator(M, H, eps=args.eps)
-        (
-            x_cute,
-            residual_cute,
-            weight_cute,
-            out_cute,
-            scale_cute,
-            residual_out_cute,
-            normalized_out_cute,
-        ) = workspace_to_cute(
-            test_input.kwargs["x"],
-            test_input.kwargs["residual"],
-            test_input.kwargs["weight"],
-            test_input.kwargs["out"],
-            test_input.kwargs["scale"],
-            test_input.kwargs["residual_out"],
-            test_input.kwargs["normalized_out"],
-        )
-        cutie_norm = cute.compile(
-            norm,
-            x=x_cute,
-            residual=residual_cute,
-            weight=weight_cute,
-            eps=args.eps,
-            out=out_cute,
-            scale=scale_cute,
-            residual_out=residual_out_cute,
-            normalized_out=normalized_out_cute,
-            stream=make_fake_stream(),
-        )
-        cutie_on_stream = functools.partial(cutie_norm, stream=stream)
-
-        baseline_result = rms_norm_fp8_unfused(**test_input.kwargs)
-        cutie_on_stream(
-            x=x_cute,
-            residual=residual_cute,
-            weight=weight_cute,
-            eps=args.eps,
-            out=out_cute,
-            scale=scale_cute,
-            residual_out=residual_out_cute,
-            normalized_out=normalized_out_cute,
-        )
-        # Check the four kernel outputs against Prime-RL, never against a
-        # separate quantization reference. Allow one FP8 step near rounding ties.
-        output_names = ("out", "scale", "residual_out", "normalized_out")
-        tolerances = ((0.15, 2**-8), (0.02, 1e-7), (0, 0), (0.02, 1e-5))
-        passed = "✅"
-        for name, reference, (rtol, atol) in zip(
-            output_names, baseline_result, tolerances
-        ):
-            actual = test_input.kwargs[name]
-            try:
-                is_close = torch.allclose(
-                    actual.float(),
-                    reference.float(),
-                    rtol=rtol,
-                    atol=atol,
+        configs = []
+        best_result = None
+        best_config = None
+        if args.find_config:
+            for threads_per_row in (32, 64, 128, 256):
+                for elements_per_thread in (4, 8):
+                    for load_path in ("shared", "direct"):
+                        for reduction in ("warp0", "all"):
+                            configs.append(
+                                Config(
+                                    elements_per_thread,
+                                    threads_per_row,
+                                    load_path,
+                                    reduction,
+                                )
+                            )
+        else:
+            configs = [
+                Config(
+                    args.elements_per_thread,
+                    args.threads_per_row,
+                    args.load_path,
+                    args.reduction,
                 )
-            except Exception as _:
-                is_close = False
+            ]
 
-            if not is_close:
-                passed = "❌"
-
+        # Use one input/reference and one baseline timing for every candidate.
+        test_input = workspace_generator(M, H, eps=args.eps)
+        baseline_result = rms_norm_fp8_unfused(**test_input.kwargs)
         time_us = benchmark(
             rms_norm_fp8_unfused,
-            workspace_generator=functools.partial(
-                workspace_generator, M, H, eps=args.eps
-            ),
+            workspace_generator=functools.partial(workspace_generator, M, H, eps=args.eps),
             workspace_count=args.workspace_count,
             warmup_iterations=args.warmup,
             iterations=args.iterations,
             stream=stream,
             use_cuda_graphs=False,
         )
-        kernel_time_us = benchmark(
-            cutie_on_stream,
-            workspace_generator=functools.partial(
-                workspace_generator, M, H, eps=args.eps, to_cute=True
-            ),
-            workspace_count=args.workspace_count,
-            warmup_iterations=args.warmup,
-            iterations=args.iterations,
-            stream=stream,
-            use_cuda_graphs=False,
-        )
-        traffic_bytes = fused_memory_bytes(M, H)
-        effective_tbps = traffic_bytes / (time_us * 1e6)
-        result = (
-            f"M: {M}, H: {H}, Correctness: {passed}, Unfused: {time_us:.3f} us, "
-            f"Cutie: {kernel_time_us:.3f} us, Speedup: {time_us / kernel_time_us:.2f}x, "
-            f"Fused traffic: {traffic_bytes / 1e6:.3f} MB, "
-            f"Effective BW: baseline {effective_tbps:.3f}, "
-            f"Cutie {traffic_bytes / (kernel_time_us * 1e6):.3f} TB/s"
-        )
-        print(result)
+
+        for config in configs:
+            # The kernel has no tail predication; only benchmark complete tiles.
+            if H % (config.threads_per_row * config.elements_per_thread):
+                message = f"H={H} must be divisible by threads_per_row * elements_per_thread for {config}"
+                if not args.find_config:
+                    raise ValueError(message)
+                print(f"Skipping: {message}")
+                continue
+            norm = RMSNorm(
+                elements_per_thread=config.elements_per_thread,
+                threads_per_row=config.threads_per_row,
+                load_path=config.load_path,
+                reduction=config.reduction,
+            )
+
+            # A previous candidate must not leave valid-looking unwritten outputs.
+            for name in ("out", "scale", "residual_out", "normalized_out"):
+                test_input.kwargs[name].fill_(float("nan"))
+            (
+                x_cute,
+                residual_cute,
+                weight_cute,
+                out_cute,
+                scale_cute,
+                residual_out_cute,
+                normalized_out_cute,
+            ) = workspace_to_cute(
+                test_input.kwargs["x"],
+                test_input.kwargs["residual"],
+                test_input.kwargs["weight"],
+                test_input.kwargs["out"],
+                test_input.kwargs["scale"],
+                test_input.kwargs["residual_out"],
+                test_input.kwargs["normalized_out"],
+            )
+            try:
+                cutie_norm = cute.compile(
+                    norm,
+                    x=x_cute,
+                    residual=residual_cute,
+                    weight=weight_cute,
+                    eps=args.eps,
+                    out=out_cute,
+                    scale=scale_cute,
+                    residual_out=residual_out_cute,
+                    normalized_out=normalized_out_cute,
+                    stream=make_fake_stream(),
+                )
+                cutie_on_stream = functools.partial(cutie_norm, stream=stream)
+
+                cutie_on_stream(
+                    x=x_cute,
+                    residual=residual_cute,
+                    weight=weight_cute,
+                    eps=args.eps,
+                    out=out_cute,
+                    scale=scale_cute,
+                    residual_out=residual_out_cute,
+                    normalized_out=normalized_out_cute,
+                )
+                # Check the four kernel outputs against Prime-RL, never against a
+                # separate quantization reference. Allow one FP8 step near rounding ties.
+                output_names = ("out", "scale", "residual_out", "normalized_out")
+                tolerances = ((0.15, 2**-8), (0.02, 1e-7), (0, 0), (0.02, 1e-5))
+                passed = True
+                for name, reference, (rtol, atol) in zip(
+                    output_names, baseline_result, tolerances
+                ):
+                    actual = test_input.kwargs[name]
+                    try:
+                        is_close = torch.allclose(
+                            actual.float(),
+                            reference.float(),
+                            rtol=rtol,
+                            atol=atol,
+                        )
+                    except Exception as _:
+                        is_close = False
+
+                    if not is_close:
+                        passed = False
+                        print(f"Correctness failed: M={M}, H={H}, config={config}, output={name}")
+
+                if not passed:
+                    if not args.find_config:
+                        raise AssertionError("Kernel outputs do not match the Prime-RL baseline")
+                    continue
+
+                kernel_time_us = benchmark(
+                    cutie_on_stream,
+                    workspace_generator=functools.partial(
+                        workspace_generator, M, H, eps=args.eps, to_cute=True
+                    ),
+                    workspace_count=args.workspace_count,
+                    warmup_iterations=args.warmup,
+                    iterations=args.iterations,
+                    stream=stream,
+                    use_cuda_graphs=False,
+                )
+                traffic_bytes = fused_memory_bytes(M, H)
+                effective_tbps = traffic_bytes / (time_us * 1e6)
+                effective_tbps_cutie = traffic_bytes / (kernel_time_us * 1e6)
+            except Exception as exc:
+                if not args.find_config:
+                    raise
+                print(f"Candidate failed: M={M}, H={H}, config={config}: {exc}")
+                continue
+
+            if not args.find_config:
+                result = (
+                    f"M: {M}, H: {H}, Correctness: ✅, Unfused: {time_us:.3f} us, "
+                    f"Cutie: {kernel_time_us:.3f} us, Speedup: {time_us / kernel_time_us:.2f}x, "
+                    f"Fused traffic: {traffic_bytes / 1e6:.3f} MB, "
+                    f"Effective BW: baseline {effective_tbps:.3f}, "
+                    f"Cutie {effective_tbps_cutie:.3f} TB/s"
+                )
+                print(result)
+            elif best_result is None or effective_tbps_cutie > best_result[1]:
+                best_result = (time_us / kernel_time_us, effective_tbps_cutie)
+                best_config = config
+
+        if best_config is not None:
+            print(
+                f"Best config for M={M}, H={H}: {best_config}, "
+                f"Speedup: {best_result[0]:.2f}x, Effective BW: {best_result[1]:.3f} TB/s"
+            )
+
+        elif args.find_config:
+            raise RuntimeError(f"No correct, benchmarkable config for M={M}, H={H}")
 
 
 if __name__ == "__main__":

@@ -123,11 +123,12 @@ class RMSNorm:
         )
         tiled_copy_g2s = None
         if const_expr(self.load_path == "shared"):
+            copy_bits = min(128, self.elements_per_thread * x.element_type.width)
             tiled_copy_g2s = cute.make_tiled_copy_tv(
                 cute.make_copy_atom(
                     cute.nvgpu.cpasync.CopyG2SOp(),
                     x.element_type,
-                    num_bits_per_copy=128,
+                    num_bits_per_copy=copy_bits,
                 ),
                 thr_layout=thr_layout,
                 val_layout=val_layout,
