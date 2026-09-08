@@ -41,10 +41,16 @@ class Config:
 
 test_configs = [
     (1024, 3072),
+    (1024, 4096),
     (1024, 7168),
     (4096, 3072),
+    (4096, 4096),
     (4096, 7168),
+    (8192, 3072),
+    (8192, 4096),
+    (8192, 7168),
     (16384, 3072),
+    (16384, 4096),
     (16384, 7168),
 ]
 
@@ -224,7 +230,9 @@ def main():
         baseline_result = rms_norm_fp8_unfused(**test_input.kwargs)
         time_us = benchmark(
             rms_norm_fp8_unfused,
-            workspace_generator=functools.partial(workspace_generator, M, H, eps=args.eps),
+            workspace_generator=functools.partial(
+                workspace_generator, M, H, eps=args.eps
+            ),
             workspace_count=args.workspace_count,
             warmup_iterations=args.warmup,
             iterations=args.iterations,
@@ -238,7 +246,6 @@ def main():
                 message = f"H={H} must be divisible by threads_per_row * elements_per_thread for {config}"
                 if not args.find_config:
                     raise ValueError(message)
-                print(f"Skipping: {message}")
                 continue
             norm = RMSNorm(
                 elements_per_thread=config.elements_per_thread,
@@ -313,11 +320,15 @@ def main():
 
                     if not is_close:
                         passed = False
-                        print(f"Correctness failed: M={M}, H={H}, config={config}, output={name}")
+                        print(
+                            f"Correctness failed: M={M}, H={H}, config={config}, output={name}"
+                        )
 
                 if not passed:
                     if not args.find_config:
-                        raise AssertionError("Kernel outputs do not match the Prime-RL baseline")
+                        raise AssertionError(
+                            "Kernel outputs do not match the Prime-RL baseline"
+                        )
                     continue
 
                 kernel_time_us = benchmark(
