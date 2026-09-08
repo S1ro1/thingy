@@ -106,14 +106,14 @@ class RMSNorm:
             (1, self.elements_per_thread), stride=(self.elements_per_thread, 1)
         )
 
-        tiled_copy_g2r = cute.make_tiled_copy_tv(
+        tiled_copy_x = cute.make_tiled_copy_tv(
             cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), x.element_type),
             thr_layout=thr_layout,
             val_layout=val_layout,
         )
         threads_per_scale = 128 // self.elements_per_thread
         num_scale_writers = self.threads_per_row // threads_per_scale
-        tiled_copy_g2r_scales = cute.make_tiled_copy_tv(
+        tiled_copy_s = cute.make_tiled_copy_tv(
             cute.make_copy_atom(cute.nvgpu.CopyUniversalOp(), scale.element_type),
             thr_layout=cute.make_layout(
                 (1, num_scale_writers),
@@ -121,10 +121,10 @@ class RMSNorm:
             ),
             val_layout=cute.make_layout((1, 1)),
         )
-        tiled_copy_g2s = None
+        tiled_copy_a = None
         if const_expr(self.load_path == "shared"):
             copy_bits = min(128, self.elements_per_thread * x.element_type.width)
-            tiled_copy_g2s = cute.make_tiled_copy_tv(
+            tiled_copy_a = cute.make_tiled_copy_tv(
                 cute.make_copy_atom(
                     cute.nvgpu.cpasync.CopyG2SOp(),
                     x.element_type,
@@ -143,9 +143,9 @@ class RMSNorm:
             scale,
             residual_out,
             normalized_out,
-            tiled_copy_g2r,
-            tiled_copy_g2s,
-            tiled_copy_g2r_scales,
+            tiled_copy_x,
+            tiled_copy_a,
+            tiled_copy_s,
         ).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
@@ -159,9 +159,9 @@ class RMSNorm:
         mSO: cute.Tensor,
         mRO: cute.Tensor,
         mNO: cute.Tensor,
-        tiled_copy_g2r: cute.TiledCopy,
-        tiled_copy_g2s: cute.TiledCopy | None,
-        tiled_copy_g2r_scales: cute.TiledCopy,
+        tiled_copy_x: cute.TiledCopy,
+        tiled_copy_a: cute.TiledCopy | None,
+        tiled_copy_sc: cute.TiledCopy,
     ) -> None:
         salloc = SmemAllocator()
         threads_per_scale = 128 // self.elements_per_thread
@@ -176,37 +176,40 @@ class RMSNorm:
         tiler_mn = (1, mX.shape[1])
         tiler_mn_scales = (1, mSO.shape[1])
 
+        # block input tiles
         gX = cute.local_tile(mX, tiler_mn, (bidx, 0))
         gR = cute.local_tile(mR, tiler_mn, (bidx, 0))
         gW = cute.make_tensor(
             mW.iterator, cute.make_layout((1, mW.shape[0]), stride=(0, mW.stride[0]))
         )
 
+        #  block output tiles
         gNO = cute.local_tile(mNO, tiler_mn, (bidx, 0))
         gRO = cute.local_tile(mRO, tiler_mn, (bidx, 0))
         gO = cute.local_tile(mO, tiler_mn, (bidx, 0))
         gSO = cute.local_tile(mSO, tiler_mn_scales, (bidx, 0))
 
-        thr_g2r = tiled_copy_g2r.get_slice(tidx)
-        thr_g2r_scale = tiled_copy_g2r_scales.get_slice(scale_writer_idx)
+        # thread local copies
+        thr_copy_x = tiled_copy_x.get_slice(tidx)
+        thr_copy_sc = tiled_copy_sc.get_slice(scale_writer_idx)
 
-        # Use the same value grouping for X, weights, and output arithmetic.
-        tXgX = thr_g2r.partition_S(gX)
-        tXgR = thr_g2r.partition_S(gR)
-        tWgW = thr_g2r.partition_S(gW)
+        # partition the global tiles into thread local for X compute path
+        tXgX = thr_copy_x.partition_S(gX)
+        tXgR = thr_copy_x.partition_S(gR)
+        tXgW = thr_copy_x.partition_S(gW)
+        tXgRO = thr_copy_x.partition_D(gRO)
+        tXgNO = thr_copy_x.partition_D(gNO)
+        tXgO = thr_copy_x.partition_D(gO)
+        
+        tSgSO = thr_copy_sc.partition_D(gSO)
 
-        tOgRO = thr_g2r.partition_D(gRO)
-        tOgNO = thr_g2r.partition_D(gNO)
-        tOgO = thr_g2r.partition_D(gO)
-        tSgSO = thr_g2r_scale.partition_D(gSO)
-
+        # Register fragments
         rX = cute.make_rmem_tensor_like(tXgX)
         rR = cute.make_rmem_tensor_like(tXgR)
-        rW = cute.make_rmem_tensor_like(tWgW)
-
-        rNO = cute.make_rmem_tensor_like(tOgNO)
-        rRO = cute.make_rmem_tensor_like(tOgRO)
-        rO = cute.make_rmem_tensor_like(tOgO)
+        rW = cute.make_rmem_tensor_like(tXgW)
+        rNO = cute.make_rmem_tensor_like(tXgNO)
+        rRO = cute.make_rmem_tensor_like(tXgRO)
+        rO = cute.make_rmem_tensor_like(tXgO)
 
         thread_sum = cute.Float32(0.0)
 
@@ -224,33 +227,33 @@ class RMSNorm:
                 byte_alignment=16,
             )
 
-            thr_g2s = tiled_copy_g2s.get_slice(tidx)
-            tXgX_async = thr_g2s.partition_S(gX)
-            tXgR_async = thr_g2s.partition_S(gR)
+            thr_copy_a = tiled_copy_a.get_slice(tidx)
+            tAgX = thr_copy_a.partition_S(gX)
+            tAgR = thr_copy_a.partition_S(gR)
 
-            tXsX_async = thr_g2s.partition_D(sX)
-            tXsR_async = thr_g2s.partition_D(sR)
+            tAsX = thr_copy_a.partition_D(sX)
+            tAsR = thr_copy_a.partition_D(sR)
 
-            cute.copy(tiled_copy_g2s, tXgX_async, tXsX_async)
-            cute.copy(tiled_copy_g2s, tXgR_async, tXsR_async)
+            cute.copy(tiled_copy_a, tAgX, tAsX)
+            cute.copy(tiled_copy_a, tAgR, tAsR)
 
             cute.arch.cp_async_commit_group()
-            cute.copy(tiled_copy_g2r, tWgW, rW)
+            cute.copy(tiled_copy_x, tXgW, rW)
             cute.arch.cp_async_wait_group(0)
 
             # Read shared memory with the compute grouping used by rX/rW/rO.
             # Each thread reads its own staged values, so no block barrier is needed.
-            tCsX = thr_g2r.partition_S(sX)
-            tCsR = thr_g2r.partition_S(sR)
+            tXsX = thr_copy_x.partition_S(sX)
+            tXsR = thr_copy_x.partition_S(sR)
 
-            cute.autovec_copy(tCsX, rX)
-            cute.autovec_copy(tCsR, rR)
+            cute.autovec_copy(tXsX, rX)
+            cute.autovec_copy(tXsR, rR)
         else:
             # Direct global → registers: no shared input row or async-copy wait.
             # Load weights early so independent memory operations can overlap.
-            cute.copy(tiled_copy_g2r, tXgX, rX)
-            cute.copy(tiled_copy_g2r, tXgR, rR)
-            cute.copy(tiled_copy_g2r, tWgW, rW)
+            cute.copy(tiled_copy_x, tXgX, rX)
+            cute.copy(tiled_copy_x, tXgR, rR)
+            cute.copy(tiled_copy_x, tXgW, rW)
 
         # Both paths retain all thread-owned X values for the output calculation.
         x_chunk = rX.load()
@@ -258,7 +261,7 @@ class RMSNorm:
 
         residual = x_chunk + r_chunk
         rRO.store(residual.to(rRO.element_type))
-        cute.copy(tiled_copy_g2r, rRO, tOgRO)
+        cute.copy(tiled_copy_x, rRO, tXgRO)
 
         residual = residual.to(cute.Float32)
         thread_sum += (residual * residual).reduce(
@@ -305,7 +308,7 @@ class RMSNorm:
         normalized = normalized * rW.load()
 
         rNO.store(normalized)
-        cute.copy(tiled_copy_g2r, rNO, tOgNO)
+        cute.copy(tiled_copy_x, rNO, tXgNO)
 
         thread_max = cute.math.abs(normalized.to(cute.Float32)).reduce(
             cute.ReductionOp.MAX,
@@ -328,7 +331,7 @@ class RMSNorm:
 
         tSrS = cute.make_tensor(rS.iterator, cute.make_layout(tSgSO.shape))
         if tidx % threads_per_scale == 0:
-            cute.copy(tiled_copy_g2r_scales, tSrS, tSgSO)
+            cute.copy(tiled_copy_sc, tSrS, tSgSO)
 
         scale_broadcast = cute.make_tensor(
             rS.iterator,
@@ -341,7 +344,7 @@ class RMSNorm:
             cute.Float8E4M3FN
         )
         rO.store(quantized)
-        cute.copy(tiled_copy_g2r, rO, tOgO)
+        cute.copy(tiled_copy_x, rO, tXgO)
 
 
 if __name__ == "__main__":
