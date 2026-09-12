@@ -24,9 +24,9 @@ import torch
 from cutlass import cute
 from cutlass.cute.runtime import from_dlpack, make_fake_stream
 from cutlass.testing import JitArguments, benchmark
+from rms_norm import RMSNorm
 
 from cutie.vendor.prime_rl.fp8_utils import per_token_cast_to_fp8_triton
-from rms_norm import RMSNorm
 
 GROUP_SIZE = 128
 
