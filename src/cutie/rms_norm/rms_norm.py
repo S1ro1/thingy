@@ -1,47 +1,11 @@
 import argparse
-import functools
 
 import cuda.bindings.driver as cuda_driver
 import torch
 from cutlass import const_expr, cute, range_constexpr
-from cutlass.cute.runtime import make_fake_stream
-from cutlass.testing import benchmark
 from cutlass.utils import SmemAllocator
 
-from cutie.utils import get_mem_util, workspace_generator, workspace_to_cute
-
 torch._dynamo.config.recompile_limit = 16
-
-
-def parse_args():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--M", type=int, default=None, required=False)
-    parser.add_argument("--H", type=int, default=None, required=False)
-    parser.add_argument("--elements_per_thread", type=int, default=8)
-    parser.add_argument("--threads_per_row", type=int, default=128)
-    parser.add_argument(
-        "--load-path",
-        choices=("shared", "direct"),
-        default="shared",
-        help="Stage X asynchronously through shared memory, or load X directly into registers.",
-    )
-    parser.add_argument(
-        "--reduction",
-        choices=("warp0", "all"),
-        default="all",
-        help="Finish the row reduction in warp 0 and broadcast, or repeat it in every warp.",
-    )
-    return parser.parse_args()
-
-
-test_configs = [
-    (1024, 3072),
-    (1024, 7168),
-    (4096, 3072),
-    (4096, 7168),
-    (16384, 3072),
-    (16384, 7168),
-]
 
 
 @torch.compile(dynamic=False)
@@ -200,7 +164,7 @@ class RMSNorm:
         tXgRO = thr_copy_x.partition_D(gRO)
         tXgNO = thr_copy_x.partition_D(gNO)
         tXgO = thr_copy_x.partition_D(gO)
-        
+
         tSgSO = thr_copy_sc.partition_D(gSO)
 
         # Register fragments
@@ -345,90 +309,3 @@ class RMSNorm:
         )
         rO.store(quantized)
         cute.copy(tiled_copy_x, rO, tXgO)
-
-
-if __name__ == "__main__":
-    args = parse_args()
-    norm = RMSNorm(
-        elements_per_thread=args.elements_per_thread,
-        threads_per_row=args.threads_per_row,
-        load_path=args.load_path,
-        reduction=args.reduction,
-    )
-    baseline_torch_stream = torch.cuda.Stream()
-    cutie_torch_stream = torch.cuda.Stream()
-    baseline_stream = cuda_driver.CUstream(baseline_torch_stream.cuda_stream)
-    cutie_stream = cuda_driver.CUstream(cutie_torch_stream.cuda_stream)
-
-    for M, H in test_configs:
-        if args.M and args.H and (M != args.M or H != args.H):
-            continue
-        test_input = workspace_generator(M, H, to_cute=False)
-        x_cute, weight_cute, out_cute = workspace_to_cute(
-            test_input.kwargs["x"],
-            test_input.kwargs["weight"],
-            test_input.kwargs["out"],
-        )
-        cutie_norm = cute.compile(
-            norm,
-            x=x_cute,
-            weight=weight_cute,
-            eps=test_input.kwargs["eps"],
-            out=out_cute,
-            stream=make_fake_stream(),
-        )
-
-        baseline_on_stream = functools.partial(
-            rms_norm_on_stream, stream=baseline_torch_stream
-        )
-        cutie_on_stream = functools.partial(cutie_norm, stream=cutie_stream)
-
-        baseline_result = rms_norm(
-            test_input.kwargs["x"],
-            test_input.kwargs["weight"],
-            test_input.kwargs["eps"],
-        )
-        cutie_torch_stream.wait_stream(torch.cuda.current_stream())
-        cutie_on_stream(
-            x=x_cute,
-            weight=weight_cute,
-            eps=test_input.kwargs["eps"],
-            out=out_cute,
-        )
-        cutie_torch_stream.synchronize()
-        is_correct = (
-            "❌"
-            if not torch.allclose(baseline_result, test_input.kwargs["out"])
-            else "✅"
-        )
-        baseline_time_us = benchmark(
-            baseline_on_stream,
-            workspace_generator=functools.partial(
-                workspace_generator, M, H, torch_stream=baseline_torch_stream
-            ),
-            warmup_iterations=20,
-            iterations=200,
-            workspace_count=200,
-            stream=baseline_stream,
-            use_cuda_graphs=True,
-        )
-        cutlass_time_us = benchmark(
-            cutie_on_stream,
-            workspace_generator=functools.partial(
-                workspace_generator,
-                M,
-                H,
-                to_cute=True,
-                torch_stream=cutie_torch_stream,
-            ),
-            warmup_iterations=20,
-            iterations=200,
-            workspace_count=200,
-            stream=cutie_stream,
-            use_cuda_graphs=True,
-        )
-        baseline_mem_util = get_mem_util(baseline_time_us, M, H)
-        cutlass_mem_util = get_mem_util(cutlass_time_us, M, H)
-        print(
-            f"M: {M}, H: {H}, Load: {args.load_path}, Reduction: {args.reduction}, Correctness: {is_correct}, Baseline: {baseline_mem_util:.2f} % vs Cutie: {cutlass_mem_util:.2f} %, Speedup: {baseline_time_us / cutlass_time_us:.2f}x"
-        )
