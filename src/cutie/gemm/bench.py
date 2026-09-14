@@ -52,10 +52,10 @@ def parse_args():
         "--scheduling",
         type=str,
         help="Tile scheduling strategy",
-        default="rowwise",
+        default="super_m",
         choices=["rowwise", "super_m"],
     )
-    parser.add_argument("--super_m", type=int, default=1)
+    parser.add_argument("--super_m", type=int, default=12)
 
     parser.add_argument("--M", type=int, help="Size for M dimension")
     parser.add_argument("--N", type=int, help="Size for N dimension")

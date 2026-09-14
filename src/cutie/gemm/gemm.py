@@ -138,8 +138,11 @@ class Gemm:
         )
 
         num_ctas = utils.HardwareInfo(0).get_device_multiprocessor_count()
-        block = (128, 1, 1)
+        block = (192, 1, 1)
         grid = (num_ctas, 1, 1)
+        self.epilogue_warp_id = (0, 1, 2, 3)
+        self.tma_warp_id = 4
+        self.mma_warp_id = 5
         self.gemm_kernel(
             A, B, out, tma_info_A, tma_info_B, smem_layout_A, smem_layout_B, tiled_mma
         ).launch(grid=grid, block=block, stream=stream)
@@ -170,7 +173,7 @@ class Gemm:
         num_tmem_cols = utils.get_num_tmem_alloc_cols(acc_fragment)
         _print(f"num_tmem_cols: {num_tmem_cols}")  # as far as I knw this is also BN
         tmem = utils.TmemAllocator(
-            barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=128)
+            barrier_for_retrieve=pipeline.NamedBarrier(barrier_id=1, num_threads=192)
         )
         tmem.allocate(num_columns=num_tmem_cols)
         tmem.wait_for_alloc()
@@ -289,7 +292,7 @@ class Gemm:
                 pipeline_tile = pipeline_base + k_tile
                 smem_stage = pipeline_tile % self.num_smem_stages
                 phase = (pipeline_tile // self.num_smem_stages) % 2
-                if cute.arch.warp_idx() == 0:
+                if cute.arch.warp_idx() == self.tma_warp_id:
                     if pipeline_tile >= self.num_smem_stages:
                         previous_tile = pipeline_tile - self.num_smem_stages
                         previous_phase = (previous_tile // self.num_smem_stages) % 2
@@ -313,7 +316,7 @@ class Gemm:
                         tBsB[None, smem_stage],
                         tma_bar_ptr=load_done + smem_stage,
                     )
-                elif cute.arch.warp_idx() == 1:
+                elif cute.arch.warp_idx() == self.mma_warp_id:
                     cute.arch.mbarrier_wait(load_done + smem_stage, phase)
                     for k_atom in range_constexpr(cute.size(tCrA, mode=[2])):
                         cute.gemm(
@@ -329,19 +332,22 @@ class Gemm:
                         tcgen05.commit(mma_done + smem_stage)
 
             # wait for non-tma/mma warps
+
             cute.arch.sync_threads()
             last_tile = pipeline_base + num_k_tiles - 1
-            last_stage = (num_k_tiles - 1) % self.num_smem_stages
+            last_stage = last_tile % self.num_smem_stages
             last_phase = (last_tile // self.num_smem_stages) % 2
-            cute.arch.mbarrier_wait(mma_done + last_stage, last_phase)
 
-            fence_after_thread_sync()
             # tmem to reg
-            cute.copy(tmem_copy, tDtC, rAcc)
-            # signal that the data is fully gone from tmem
-            cute.arch.fence_view_async_tmem_load()
-            rC.store(rAcc.load().to(mC.element_type))
-            cute.autovec_copy(rC, tDgC)
+            if cute.arch.warp_idx() in self.epilogue_warp_id:
+                cute.arch.mbarrier_wait(mma_done + last_stage, last_phase)
+                fence_after_thread_sync()
+
+                cute.copy(tmem_copy, tDtC, rAcc)
+                # signal that the data is fully gone from tmem
+                cute.arch.fence_view_async_tmem_load()
+                rC.store(rAcc.load().to(mC.element_type))
+                cute.autovec_copy(rC, tDgC)
 
             cute.arch.sync_threads()
             pipeline_base += num_k_tiles
