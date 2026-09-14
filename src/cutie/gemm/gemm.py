@@ -28,6 +28,8 @@ class Gemm:
         self.BN = BN
         self.BK = BK
 
+        self._elements_per_copy = 8
+
     @cute.jit
     def __call__(
         self,
@@ -36,7 +38,7 @@ class Gemm:
         out: cute.Tensor,
         stream: cuda_driver.CUstream,
     ):
-        M, K = A.shape
+        M, _ = A.shape
         N, _ = B.shape
 
         mma_op = tcgen05.MmaF16BF16Op(
@@ -53,18 +55,22 @@ class Gemm:
             mma_op, permutation_mnk=(self.BM, self.BN, self.BK)
         )
 
-        threads_per_k = self.BK // 8
+        threads_per_k = self.BK // self._elements_per_copy
 
         copy_atom = cute.make_copy_atom(
-            cute.nvgpu.CopyUniversalOp(),
+            cute.nvgpu.cpasync.CopyG2SOp(),
             A.element_type,
+            num_bits_per_copy=self._elements_per_copy * A.element_type.width,
         )
+
         tiled_copy = cute.make_tiled_copy_tv(
             copy_atom,
             thr_layout=cute.make_layout(
                 (128 // threads_per_k, threads_per_k), stride=(threads_per_k, 1)
             ),
-            val_layout=cute.make_layout((1, 8), stride=(8, 1)),
+            val_layout=cute.make_layout(
+                (1, self._elements_per_copy), stride=(self._elements_per_copy, 1)
+            ),
         )
 
         block = (128, 1, 1)
@@ -173,8 +179,8 @@ class Gemm:
 
         tAsA = thr_copy.partition_D(sA)
         tBsB = thr_copy.partition_D(sB)
-        tArA = cute.make_rmem_tensor_like(tAsA)
-        tBrB = cute.make_rmem_tensor_like(tBsB)
+        # tArA = cute.make_rmem_tensor_like(tAsA)
+        # tBrB = cute.make_rmem_tensor_like(tBsB)
 
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         mma_done = salloc.allocate(cute.Int64, byte_alignment=8)
@@ -191,10 +197,11 @@ class Gemm:
             tAgA = thr_copy.partition_S(gA)
             tBgB = thr_copy.partition_S(gB)
 
-            cute.copy(tiled_copy, tAgA, tArA)
-            cute.copy(tiled_copy, tBgB, tBrB)
-            cute.copy(tiled_copy, tArA, tAsA)
-            cute.copy(tiled_copy, tBrB, tBsB)
+            cute.copy(tiled_copy, tAgA, tAsA)
+            cute.copy(tiled_copy, tBgB, tBsB)
+
+            cute.arch.cp_async_commit_group()
+            cute.arch.cp_async_wait_group(0)
 
             # signal mma that the data is ready
             cute.arch.fence_view_async_shared()
