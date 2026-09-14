@@ -2,7 +2,7 @@ import os
 
 import cuda.bindings.driver as cuda_driver
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import const_expr, cute, dsl_user_op, pipeline, range_constexpr, utils
+from cutlass import cute, dsl_user_op, pipeline, range_constexpr, utils
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils import SmemAllocator
@@ -89,9 +89,9 @@ class Gemm:
             (self.BN, self.BK),
         )
 
+        num_ctas = utils.HardwareInfo(0).get_device_multiprocessor_count()
         block = (128, 1, 1)
-        grid = (M // self.BM, N // self.BN, 1)
-
+        grid = (num_ctas, 1, 1)
         self.gemm_kernel(
             A, B, out, tma_info_A, tma_info_B, smem_layout_A, smem_layout_B, tiled_mma
         ).launch(grid=grid, block=block, stream=stream)
@@ -111,8 +111,9 @@ class Gemm:
     ):
         salloc = SmemAllocator()
 
-        bidx, bidy, _ = cute.arch.block_idx()
+        bidx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
+        num_ctas, _, _ = cute.arch.grid_dim()
 
         thr_mma = tiled_mma.get_slice(0)
         acc_shape = tiled_mma.partition_shape_C((self.BM, self.BN))
@@ -135,20 +136,6 @@ class Gemm:
         )
         tmem_copy = tcgen05.make_tmem_copy(tmem_atom, tCtAcc)
         thr_tmem = tmem_copy.get_slice(tidx)
-        gC = cute.local_tile(mC, (self.BM, self.BN), (bidx, bidy))
-
-        # this threads partition of C in global mem
-        tCgC = thr_mma.partition_C(gC)
-
-        # this threads partition of the TMEM
-        tDtC = thr_tmem.partition_S(tCtAcc)
-        # this threads partition of C in global mem
-        tDgC = thr_tmem.partition_D(tCgC)
-
-        # accum dtype fp32, we copy from tmem to registers
-        rAcc = cute.make_rmem_tensor(tDgC.shape, cute.Float32)
-        # output dtype bf16, we copy from reg to reg
-        rC = cute.make_rmem_tensor(tDgC.shape, mC.element_type)
 
         # allocate with outer/inner
         sA = salloc.allocate_tensor(
@@ -193,90 +180,122 @@ class Gemm:
         _print(f"tCrA: {tCrA}")
         _print(f"tCrB: {tCrB}")
 
-        gA = cute.local_tile(tma_info_A.tma_tensor, (self.BM, self.BK), (bidx, None))
-        gB = cute.local_tile(tma_info_B.tma_tensor, (self.BN, self.BK), (bidy, None))
-        _print(f"gA: {gA}")
-        _print(f"sA: {sA}")
-
-        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
-            tma_info_A.atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sA, 0, 2),
-            cute.group_modes(gA, 0, 2),
+        tile_idx = bidx
+        total_output_tiles = (cute.size(mC, mode=[0]) // self.BM) * (
+            cute.size(mC, mode=[1]) // self.BN
         )
-        tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
-            tma_info_B.atom,
-            0,
-            cute.make_layout(1),
-            cute.group_modes(sB, 0, 2),
-            cute.group_modes(gB, 0, 2),
-        )
-
-        _print(f"tAgA: {tAgA}")
-        _print(f"tAsA: {tAsA}")
-
-        tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        cute.arch.mbarrier_init_fence()
-        cute.arch.sync_threads()
+        bidx = tile_idx // (cute.size(mC, mode=[1]))
+        bidy = tile_idx % (cute.size(mC, mode=[1]))
 
         num_k_tiles = cute.size(mA, mode=[1]) // self.BK
-        for k_tile in range(num_k_tiles):
-            smem_stage = k_tile % self.num_smem_stages
-            phase = (k_tile // self.num_smem_stages) % 2
-            if cute.arch.warp_idx() == 0:
-                if k_tile >= self.num_smem_stages:
-                    previous_tile = k_tile - self.num_smem_stages
-                    previous_phase = (previous_tile // self.num_smem_stages) % 2
-                    cute.arch.mbarrier_wait(
-                        mma_done + smem_stage,
-                        previous_phase,
-                    )
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        load_done + smem_stage, expected_bytes
-                    )
-                cute.copy(
-                    tma_info_A.atom,
-                    tAgA[None, k_tile],
-                    tAsA[None, smem_stage],
-                    tma_bar_ptr=load_done + smem_stage,
-                )
-                cute.copy(
-                    tma_info_B.atom,
-                    tBgB[None, k_tile],
-                    tBsB[None, smem_stage],
-                    tma_bar_ptr=load_done + smem_stage,
-                )
-            elif cute.arch.warp_idx() == 1:
-                cute.arch.mbarrier_wait(load_done + smem_stage, phase)
-                for k_atom in range_constexpr(cute.size(tCrA, mode=[2])):
-                    cute.gemm(
-                        tiled_mma,
-                        tCtAcc,
-                        tCrA[None, None, k_atom, smem_stage],
-                        tCrB[None, None, k_atom, smem_stage],
-                        tCtAcc,
-                    )
-                    tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+        num_n_tiles = cute.size(mC, mode=[1]) // self.BN
 
-                with cute.arch.elect_one():
-                    tcgen05.commit(mma_done + smem_stage)
+        # this signals the base for current tile
+        pipeline_base = 0
 
-        # wait for non-tma/mma warps
-        cute.arch.sync_threads()
-        last_tile = num_k_tiles - 1
-        last_stage = (num_k_tiles - 1) % self.num_smem_stages
-        last_phase = (last_tile // self.num_smem_stages) % 2
-        cute.arch.mbarrier_wait(mma_done + last_stage, last_phase)
+        while tile_idx < total_output_tiles:
+            bidx = tile_idx // num_n_tiles
+            bidy = tile_idx % num_n_tiles
+            gA = cute.local_tile(
+                tma_info_A.tma_tensor, (self.BM, self.BK), (bidx, None)
+            )
+            gB = cute.local_tile(
+                tma_info_B.tma_tensor, (self.BN, self.BK), (bidy, None)
+            )
+            _print(f"gA: {gA}")
+            _print(f"sA: {sA}")
 
-        fence_after_thread_sync()
-        # tmem to reg
-        cute.copy(tmem_copy, tDtC, rAcc)
-        # signal that the data is fully gone from tmem
-        cute.arch.fence_view_async_tmem_load()
-        rC.store(rAcc.load().to(mC.element_type))
-        cute.autovec_copy(rC, tDgC)
+            tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+                tma_info_A.atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sA, 0, 2),
+                cute.group_modes(gA, 0, 2),
+            )
+            tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+                tma_info_B.atom,
+                0,
+                cute.make_layout(1),
+                cute.group_modes(sB, 0, 2),
+                cute.group_modes(gB, 0, 2),
+            )
+            gC = cute.local_tile(mC, (self.BM, self.BN), (bidx, bidy))
+
+            # this threads partition of C in global mem
+            tCgC = thr_mma.partition_C(gC)
+
+            # this threads partition of the TMEM
+            tDtC = thr_tmem.partition_S(tCtAcc)
+            # this threads partition of C in global mem
+            tDgC = thr_tmem.partition_D(tCgC)
+
+            # accum dtype fp32, we copy from tmem to registers
+            rAcc = cute.make_rmem_tensor(tDgC.shape, cute.Float32)
+            # output dtype bf16, we copy from reg to reg
+            rC = cute.make_rmem_tensor(tDgC.shape, mC.element_type)
+            tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
+
+            for k_tile in range(num_k_tiles):
+                pipeline_tile = pipeline_base + k_tile
+                smem_stage = pipeline_tile % self.num_smem_stages
+                phase = (pipeline_tile // self.num_smem_stages) % 2
+                if cute.arch.warp_idx() == 0:
+                    if pipeline_tile >= self.num_smem_stages:
+                        previous_tile = pipeline_tile - self.num_smem_stages
+                        previous_phase = (previous_tile // self.num_smem_stages) % 2
+                        cute.arch.mbarrier_wait(
+                            mma_done + smem_stage,
+                            previous_phase,
+                        )
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            load_done + smem_stage, expected_bytes
+                        )
+                    cute.copy(
+                        tma_info_A.atom,
+                        tAgA[None, k_tile],
+                        tAsA[None, smem_stage],
+                        tma_bar_ptr=load_done + smem_stage,
+                    )
+                    cute.copy(
+                        tma_info_B.atom,
+                        tBgB[None, k_tile],
+                        tBsB[None, smem_stage],
+                        tma_bar_ptr=load_done + smem_stage,
+                    )
+                elif cute.arch.warp_idx() == 1:
+                    cute.arch.mbarrier_wait(load_done + smem_stage, phase)
+                    for k_atom in range_constexpr(cute.size(tCrA, mode=[2])):
+                        cute.gemm(
+                            tiled_mma,
+                            tCtAcc,
+                            tCrA[None, None, k_atom, smem_stage],
+                            tCrB[None, None, k_atom, smem_stage],
+                            tCtAcc,
+                        )
+                        tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
+
+                    with cute.arch.elect_one():
+                        tcgen05.commit(mma_done + smem_stage)
+
+            # wait for non-tma/mma warps
+            cute.arch.sync_threads()
+            last_tile = pipeline_base + num_k_tiles - 1
+            last_stage = (num_k_tiles - 1) % self.num_smem_stages
+            last_phase = (last_tile // self.num_smem_stages) % 2
+            cute.arch.mbarrier_wait(mma_done + last_stage, last_phase)
+
+            fence_after_thread_sync()
+            # tmem to reg
+            cute.copy(tmem_copy, tDtC, rAcc)
+            # signal that the data is fully gone from tmem
+            cute.arch.fence_view_async_tmem_load()
+            rC.store(rAcc.load().to(mC.element_type))
+            cute.autovec_copy(rC, tDgC)
+
+            cute.arch.sync_threads()
+            pipeline_base += num_k_tiles
+            tile_idx += num_ctas
 
         cute.arch.sync_threads()
         tmem.relinquish_alloc_permit()
