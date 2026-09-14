@@ -1,8 +1,9 @@
 import os
 
 import cuda.bindings.driver as cuda_driver
+import cutlass
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import cute, dsl_user_op, pipeline, range_constexpr, utils
+from cutlass import const_expr, cute, dsl_user_op, pipeline, range_constexpr, utils
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils import SmemAllocator
@@ -23,13 +24,60 @@ def _print(*args, **kwargs):
 
 
 class Gemm:
-    def __init__(self, BM: int, BN: int, BK: int, num_smem_stages: int = 1):
+    def __init__(
+        self,
+        BM: int,
+        BN: int,
+        BK: int,
+        num_smem_stages: int = 1,
+        scheduling: str = "rowwise",
+        super_m: int = 1,
+    ):
         self.BM = BM
         self.BN = BN
         self.BK = BK
         self.num_smem_stages = num_smem_stages
+        self.scheduling = scheduling
+        self.super_m = super_m
+
+        if super_m != 1 and scheduling != "super_m":
+            raise ValueError(
+                f"Invalid scheduling: {scheduling}, must be 'super_m' when super_m is not 1"
+            )
+
+        assert self.scheduling in ("rowwise", "super_m"), (
+            f"Invalid scheduling: {self.scheduling}, must be one of ('rowwise', 'super_m')"
+        )
 
         self._elements_per_copy = 8
+
+    @cute.jit
+    def rowwise_scheduling(
+        self, tile_idx: cute.Int32, num_m_tiles: cute.Int32, num_n_tiles: cute.Int32
+    ) -> tuple[cute.Int32, cute.Int32]:
+        bidx = tile_idx // num_n_tiles
+        bidy = tile_idx % num_n_tiles
+        return bidx, bidy
+
+    @cute.jit
+    def super_m_scheduling(
+        self, tile_idx: cute.Int32, num_m_tiles: cute.Int32, num_n_tiles: cute.Int32
+    ) -> tuple[cute.Int32, cute.Int32]:
+        tiles_per_band = self.super_m * num_n_tiles
+
+        band_idx = tile_idx // tiles_per_band
+        tile_in_band = tile_idx % tiles_per_band
+
+        first_m = band_idx * self.super_m
+        band_height = cutlass.min(num_m_tiles - first_m, self.super_m)
+
+        m_in_band = tile_in_band % band_height
+        n_in_band = tile_in_band // band_height
+
+        bidx = first_m + m_in_band
+        bidy = n_in_band
+
+        return bidx, bidy
 
     @cute.jit
     def __call__(
@@ -184,18 +232,20 @@ class Gemm:
         total_output_tiles = (cute.size(mC, mode=[0]) // self.BM) * (
             cute.size(mC, mode=[1]) // self.BN
         )
-        bidx = tile_idx // (cute.size(mC, mode=[1]))
-        bidy = tile_idx % (cute.size(mC, mode=[1]))
 
-        num_k_tiles = cute.size(mA, mode=[1]) // self.BK
+        num_m_tiles = cute.size(mC, mode=[0]) // self.BM
         num_n_tiles = cute.size(mC, mode=[1]) // self.BN
-
+        num_k_tiles = cute.size(mA, mode=[1]) // self.BK
         # this signals the base for current tile
         pipeline_base = 0
+        bidx, bidy = 0, 0
 
         while tile_idx < total_output_tiles:
-            bidx = tile_idx // num_n_tiles
-            bidy = tile_idx % num_n_tiles
+            if const_expr(self.scheduling == "rowwise"):
+                bidx, bidy = self.rowwise_scheduling(tile_idx, num_m_tiles, num_n_tiles)
+            elif const_expr(self.scheduling == "super_m"):
+                bidx, bidy = self.super_m_scheduling(tile_idx, num_m_tiles, num_n_tiles)
+
             gA = cute.local_tile(
                 tma_info_A.tma_tensor, (self.BM, self.BK), (bidx, None)
             )
