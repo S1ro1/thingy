@@ -216,88 +216,55 @@ class Gemm:
         _print(f"tAgA: {tAgA}")
         _print(f"tAsA: {tAsA}")
 
-        # prefetch N-1
-        # this will prob break on small K but who cares
-        for load_k_tile in range_constexpr(self.num_smem_stages - 1):
-            if cute.arch.warp_idx() == 0:
-                with cute.arch.elect_one():
-                    cute.arch.mbarrier_arrive_and_expect_tx(
-                        load_done + load_k_tile, expected_bytes
-                    )
-                cute.copy(
-                    tma_info_A.atom,
-                    tAgA[None, load_k_tile],
-                    tAsA[None, load_k_tile],
-                    tma_bar_ptr=load_done + load_k_tile,
-                )
-                cute.copy(
-                    tma_info_B.atom,
-                    tBgB[None, load_k_tile],
-                    tBsB[None, load_k_tile],
-                    tma_bar_ptr=load_done + load_k_tile,
-                )
-
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
         num_k_tiles = cute.size(mA, mode=[1]) // self.BK
         for k_tile in range(num_k_tiles):
-            consume_k_tile = k_tile
-            load_k_tile = k_tile + self.num_smem_stages - 1
-            consume_smem_stage = consume_k_tile % self.num_smem_stages
-            load_smem_stage = load_k_tile % self.num_smem_stages
-            consume_phase = (consume_k_tile // self.num_smem_stages) % 2
-            # prefetch Nth
-            if k_tile < num_k_tiles - self.num_smem_stages + 1:
-                # wait for free of the smem stage we are about to load into
-                if load_k_tile >= self.num_smem_stages:
-                    previous_tile = load_k_tile - self.num_smem_stages
+            smem_stage = k_tile % self.num_smem_stages
+            phase = (k_tile // self.num_smem_stages) % 2
+            if cute.arch.warp_idx() == 0:
+                if k_tile >= self.num_smem_stages:
+                    previous_tile = k_tile - self.num_smem_stages
                     previous_phase = (previous_tile // self.num_smem_stages) % 2
                     cute.arch.mbarrier_wait(
-                        mma_done + load_smem_stage,
+                        mma_done + smem_stage,
                         previous_phase,
                     )
-                if cute.arch.warp_idx() == 0:
-                    with cute.arch.elect_one():
-                        cute.arch.mbarrier_arrive_and_expect_tx(
-                            load_done + load_smem_stage, expected_bytes
-                        )
-                    cute.copy(
-                        tma_info_A.atom,
-                        tAgA[None, load_k_tile],
-                        tAsA[None, load_smem_stage],
-                        tma_bar_ptr=load_done + load_smem_stage,
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        load_done + smem_stage, expected_bytes
                     )
-                    cute.copy(
-                        tma_info_B.atom,
-                        tBgB[None, load_k_tile],
-                        tBsB[None, load_smem_stage],
-                        tma_bar_ptr=load_done + load_smem_stage,
-                    )
-
-            # signal mma that the data is ready
-            cute.arch.fence_view_async_shared()
-            cute.arch.mbarrier_wait(load_done + consume_smem_stage, consume_phase)
-            cute.arch.sync_threads()
-
-            if cute.arch.warp_idx() == 0:
+                cute.copy(
+                    tma_info_A.atom,
+                    tAgA[None, k_tile],
+                    tAsA[None, smem_stage],
+                    tma_bar_ptr=load_done + smem_stage,
+                )
+                cute.copy(
+                    tma_info_B.atom,
+                    tBgB[None, k_tile],
+                    tBsB[None, smem_stage],
+                    tma_bar_ptr=load_done + smem_stage,
+                )
+            elif cute.arch.warp_idx() == 1:
+                cute.arch.mbarrier_wait(load_done + smem_stage, phase)
                 for k_atom in range_constexpr(cute.size(tCrA, mode=[2])):
                     cute.gemm(
                         tiled_mma,
                         tCtAcc,
-                        tCrA[None, None, k_atom, consume_smem_stage],
-                        tCrB[None, None, k_atom, consume_smem_stage],
+                        tCrA[None, None, k_atom, smem_stage],
+                        tCrB[None, None, k_atom, smem_stage],
                         tCtAcc,
                     )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                 with cute.arch.elect_one():
-                    tcgen05.commit(mma_done + consume_smem_stage)
+                    tcgen05.commit(mma_done + smem_stage)
 
-            cute.arch.sync_threads()
-
+        # wait for non-tma/mma warps
+        cute.arch.sync_threads()
         last_tile = num_k_tiles - 1
         last_stage = (num_k_tiles - 1) % self.num_smem_stages
         last_phase = (last_tile // self.num_smem_stages) % 2
