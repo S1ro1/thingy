@@ -32,6 +32,7 @@ class Gemm:
         num_smem_stages: int = 1,
         scheduling: str = "rowwise",
         super_m: int = 1,
+        num_acc_stages: int = 1,
     ):
         self.BM = BM
         self.BN = BN
@@ -39,6 +40,7 @@ class Gemm:
         self.num_smem_stages = num_smem_stages
         self.scheduling = scheduling
         self.super_m = super_m
+        self.num_acc_stages = num_acc_stages
 
         if super_m != 1 and scheduling != "super_m":
             raise ValueError(
@@ -168,7 +170,9 @@ class Gemm:
 
         thr_mma = tiled_mma.get_slice(0)
         acc_shape = tiled_mma.partition_shape_C((self.BM, self.BN))
-        acc_fragment = tiled_mma.make_fragment_C(acc_shape)
+        acc_fragment = tiled_mma.make_fragment_C(
+            cute.append(acc_shape, self.num_acc_stages)
+        )
 
         num_tmem_cols = utils.get_num_tmem_alloc_cols(acc_fragment)
         _print(f"num_tmem_cols: {num_tmem_cols}")  # as far as I knw this is also BN
@@ -179,13 +183,13 @@ class Gemm:
         tmem.wait_for_alloc()
 
         tmem_ptr = tmem.retrieve_ptr(cute.Float32)
-        tCtAcc = cute.make_tensor(tmem_ptr, acc_fragment.layout)
+        tCtAcc_base = cute.make_tensor(tmem_ptr, acc_fragment.layout)
 
         tmem_atom = cute.make_copy_atom(
             tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),
             cute.Float32,
         )
-        tmem_copy = tcgen05.make_tmem_copy(tmem_atom, tCtAcc)
+        tmem_copy = tcgen05.make_tmem_copy(tmem_atom, tCtAcc_base[None, None, None, 0])
         thr_tmem = tmem_copy.get_slice(tidx)
 
         # allocate with outer/inner
@@ -207,11 +211,21 @@ class Gemm:
         load_done = salloc.allocate_tensor(
             cute.Int64, cute.make_layout(self.num_smem_stages), byte_alignment=8
         ).iterator
+        acc_empty = salloc.allocate_tensor(
+            cute.Int64, cute.make_layout(self.num_acc_stages), byte_alignment=8
+        ).iterator
+        acc_ready = salloc.allocate_tensor(
+            cute.Int64, cute.make_layout(self.num_acc_stages), byte_alignment=8
+        ).iterator
         expected_bytes = ((self.BM + self.BN) * self.BK * mA.element_type.width) // 8
         if tidx == 0:
             for stage in range_constexpr(self.num_smem_stages):
                 cute.arch.mbarrier_init(mma_done + stage, 1)
                 cute.arch.mbarrier_init(load_done + stage, 1)
+
+            for stage in range_constexpr(self.num_acc_stages):
+                cute.arch.mbarrier_init(acc_empty + stage, 4)
+                cute.arch.mbarrier_init(acc_ready + stage, 1)
 
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
@@ -242,8 +256,14 @@ class Gemm:
         # this signals the base for current tile
         pipeline_base = 0
         bidx, bidy = 0, 0
+        acc_stage = 0
+        t = 0
 
         while tile_idx < total_output_tiles:
+            acc_stage = t % self.num_acc_stages
+            acc_phase = (t // self.num_acc_stages) % 2
+
+            tCtAcc = tCtAcc_base[None, None, None, acc_stage]
             if const_expr(self.scheduling == "rowwise"):
                 bidx, bidy = self.rowwise_scheduling(tile_idx, num_m_tiles, num_n_tiles)
             elif const_expr(self.scheduling == "super_m"):
@@ -288,6 +308,13 @@ class Gemm:
             rC = cute.make_rmem_tensor(tDgC.shape, mC.element_type)
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
+            # wait for the current epilogue tmem to be empty
+            if cute.arch.warp_idx() == self.mma_warp_id and t >= self.num_acc_stages:
+                previous_acc_phase = (
+                    (t - self.num_acc_stages) // self.num_acc_stages
+                ) % 2
+                cute.arch.mbarrier_wait(acc_empty + acc_stage, previous_acc_phase)
+
             for k_tile in range(num_k_tiles):
                 pipeline_tile = pipeline_base + k_tile
                 smem_stage = pipeline_tile % self.num_smem_stages
@@ -331,27 +358,29 @@ class Gemm:
                     with cute.arch.elect_one():
                         tcgen05.commit(mma_done + smem_stage)
 
-            # wait for non-tma/mma warps
-
-            cute.arch.sync_threads()
-            last_tile = pipeline_base + num_k_tiles - 1
-            last_stage = last_tile % self.num_smem_stages
-            last_phase = (last_tile // self.num_smem_stages) % 2
+            if cute.arch.warp_idx() == self.mma_warp_id:
+                with cute.arch.elect_one():
+                    tcgen05.commit(acc_ready + acc_stage)
 
             # tmem to reg
             if cute.arch.warp_idx() in self.epilogue_warp_id:
-                cute.arch.mbarrier_wait(mma_done + last_stage, last_phase)
+                # wait for buffer to be ready
+                cute.arch.mbarrier_wait(acc_ready + acc_stage, acc_phase)
+                # order following tmems after that synchronization above
                 fence_after_thread_sync()
-
                 cute.copy(tmem_copy, tDtC, rAcc)
-                # signal that the data is fully gone from tmem
+                # signal that the data is fully gone from tmem and signals registers are ready
                 cute.arch.fence_view_async_tmem_load()
+                cute.arch.sync_warp()
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive(acc_empty + acc_stage)
+
                 rC.store(rAcc.load().to(mC.element_type))
                 cute.autovec_copy(rC, tDgC)
 
-            cute.arch.sync_threads()
             pipeline_base += num_k_tiles
             tile_idx += num_ctas
+            t += 1
 
         cute.arch.sync_threads()
         tmem.relinquish_alloc_permit()
