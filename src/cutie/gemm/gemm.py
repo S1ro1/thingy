@@ -55,31 +55,46 @@ class Gemm:
         tiled_mma = cute.make_tiled_mma(
             mma_op, permutation_mnk=(self.BM, self.BN, self.BK)
         )
+        smem_atom_kind = sm100_utils.get_smem_layout_atom_ab(
+            cute.nvgpu.OperandMajorMode.K,
+            cute.BFloat16,
+            (self.BM, self.BK),
+        )
+        _print(f"smem_atom_kind: {smem_atom_kind}")
+        smem_atom = tcgen05.make_smem_layout_atom(smem_atom_kind, cute.BFloat16)
 
-        threads_per_k = self.BK // self._elements_per_copy
+        _print(f"smem_atom: {smem_atom}")
 
-        copy_atom = cute.make_copy_atom(
-            cute.nvgpu.cpasync.CopyG2SOp(),
-            A.element_type,
-            num_bits_per_copy=self._elements_per_copy * A.element_type.width,
+        # ((rows_in_band, num_bands), (K_elements_per_swizzle_atom, num_K_tiles))
+        # - with BK=128, get_smem_layout_atom_ab will choose K_SW128, where K atom is 128 bytes (64 elements wide), so for us we have 2 K tiles per swizzle atom - ((..., ...), (64, 2))
+        # - with BK=64, we still get K_SW128, but now we have 1 K tile per swizzle atom - ((..., ...), (64, 1))
+        # - with BK=32, we get K_SW64, where K atom is 64 bytes (32 elements wide), so we have 1 K tile per swizzle atom - ((..., ...), (32, 1))
+        smem_layout_A = cute.tile_to_shape(
+            smem_atom, (self.BM, self.BK, self.num_smem_stages), order=(1, 0, 2)
+        )
+        smem_layout_B = cute.tile_to_shape(
+            smem_atom, (self.BN, self.BK, self.num_smem_stages), order=(1, 0, 2)
         )
 
-        tiled_copy = cute.make_tiled_copy_tv(
-            copy_atom,
-            thr_layout=cute.make_layout(
-                (128 // threads_per_k, threads_per_k), stride=(threads_per_k, 1)
-            ),
-            val_layout=cute.make_layout(
-                (1, self._elements_per_copy), stride=(self._elements_per_copy, 1)
-            ),
+        tma_info_A = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            A,
+            cute.select(smem_layout_A, mode=[0, 1]),
+            (self.BM, self.BK),
+        )
+        tma_info_B = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileG2SOp(),
+            B,
+            cute.select(smem_layout_B, mode=[0, 1]),
+            (self.BN, self.BK),
         )
 
         block = (128, 1, 1)
         grid = (M // self.BM, N // self.BN, 1)
 
-        self.gemm_kernel(A, B, out, tiled_mma, tiled_copy).launch(
-            grid=grid, block=block, stream=stream
-        )
+        self.gemm_kernel(
+            A, B, out, tma_info_A, tma_info_B, smem_layout_A, smem_layout_B, tiled_mma
+        ).launch(grid=grid, block=block, stream=stream)
 
     @cute.kernel
     def gemm_kernel(
@@ -87,8 +102,12 @@ class Gemm:
         mA: cute.Tensor,
         mB: cute.Tensor,
         mC: cute.Tensor,
+        tma_info_A: cute.nvgpu.cpasync.TmaInfo,
+        tma_info_B: cute.nvgpu.cpasync.TmaInfo,
+        # we need to pass these as tma_info.smem_layout loses the notion of stages
+        smem_layout_A: cute.ComposedLayout,
+        smem_layout_B: cute.ComposedLayout,
         tiled_mma: cute.TiledMma,
-        tiled_copy: cute.TiledCopy,
     ):
         salloc = SmemAllocator()
 
@@ -131,40 +150,34 @@ class Gemm:
         # output dtype bf16, we copy from reg to reg
         rC = cute.make_rmem_tensor(tDgC.shape, mC.element_type)
 
-        smem_atom_kind = sm100_utils.get_smem_layout_atom_ab(
-            cute.nvgpu.OperandMajorMode.K,
-            cute.BFloat16,
-            (self.BM, self.BK),
-        )
-        _print(f"smem_atom_kind: {smem_atom_kind}")
-        smem_atom = tcgen05.make_smem_layout_atom(smem_atom_kind, cute.BFloat16)
-
-        _print(f"smem_atom: {smem_atom}")
-
-        # ((rows_in_band, num_bands), (K_elements_per_swizzle_atom, num_K_tiles))
-        # - with BK=128, get_smem_layout_atom_ab will choose K_SW128, where K atom is 128 bytes (64 elements wide), so for us we have 2 K tiles per swizzle atom - ((..., ...), (64, 2))
-        # - with BK=64, we still get K_SW128, but now we have 1 K tile per swizzle atom - ((..., ...), (64, 1))
-        # - with BK=32, we get K_SW64, where K atom is 64 bytes (32 elements wide), so we have 1 K tile per swizzle atom - ((..., ...), (32, 1))
-        layout_A = cute.tile_to_shape(
-            smem_atom, (self.BM, self.BK, self.num_smem_stages), order=(1, 0, 2)
-        )
-        layout_B = cute.tile_to_shape(
-            smem_atom, (self.BN, self.BK, self.num_smem_stages), order=(1, 0, 2)
-        )
-
         # allocate with outer/inner
         sA = salloc.allocate_tensor(
             mA.element_type,
-            layout_A.outer,
+            smem_layout_A.outer,
             byte_alignment=1024,
-            swizzle=layout_A.inner,
+            swizzle=smem_layout_A.inner,
         )
         sB = salloc.allocate_tensor(
             mB.element_type,
-            layout_B.outer,
+            smem_layout_B.outer,
             byte_alignment=1024,
-            swizzle=layout_B.inner,
+            swizzle=smem_layout_B.inner,
         )
+        mma_done = salloc.allocate_tensor(
+            cute.Int64, cute.make_layout(self.num_smem_stages), byte_alignment=8
+        ).iterator
+        load_done = salloc.allocate_tensor(
+            cute.Int64, cute.make_layout(self.num_smem_stages), byte_alignment=8
+        ).iterator
+        expected_bytes = ((self.BM + self.BN) * self.BK * mA.element_type.width) // 8
+        if tidx == 0:
+            for stage in range_constexpr(self.num_smem_stages):
+                cute.arch.mbarrier_init(mma_done + stage, 1)
+                cute.arch.mbarrier_init(load_done + stage, 1)
+
+        cute.arch.mbarrier_init_fence()
+        cute.arch.sync_threads()
+
         _print(f"sA: {sA}")
         _print(f"sB: {sB}")
 
@@ -180,40 +193,51 @@ class Gemm:
         _print(f"tCrA: {tCrA}")
         _print(f"tCrB: {tCrB}")
 
-        thr_copy = tiled_copy.get_slice(tidx)
+        gA = cute.local_tile(tma_info_A.tma_tensor, (self.BM, self.BK), (bidx, None))
+        gB = cute.local_tile(tma_info_B.tma_tensor, (self.BN, self.BK), (bidy, None))
+        _print(f"gA: {gA}")
+        _print(f"sA: {sA}")
 
-        tAsA = thr_copy.partition_D(sA)
-        tBsB = thr_copy.partition_D(sB)
+        tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
+            tma_info_A.atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sA, 0, 2),
+            cute.group_modes(gA, 0, 2),
+        )
+        tBsB, tBgB = cute.nvgpu.cpasync.tma_partition(
+            tma_info_B.atom,
+            0,
+            cute.make_layout(1),
+            cute.group_modes(sB, 0, 2),
+            cute.group_modes(gB, 0, 2),
+        )
+
+        _print(f"tAgA: {tAgA}")
         _print(f"tAsA: {tAsA}")
-        _print(f"tBsB: {tBsB}")
-
-        gA = cute.local_tile(mA, (self.BM, self.BK), (bidx, None))
-        gB = cute.local_tile(mB, (self.BN, self.BK), (bidy, None))
-        tAgA = thr_copy.partition_S(gA)
-        tBgB = thr_copy.partition_S(gB)
 
         # prefetch N-1
         # this will prob break on small K but who cares
         for load_k_tile in range_constexpr(self.num_smem_stages - 1):
-            cute.copy(
-                tiled_copy,
-                tAgA[None, None, None, load_k_tile],
-                tAsA[None, None, None, load_k_tile % self.num_smem_stages],
-            )
-            cute.copy(
-                tiled_copy,
-                tBgB[None, None, None, load_k_tile],
-                tBsB[None, None, None, load_k_tile % self.num_smem_stages],
-            )
-            cute.arch.cp_async_commit_group()
+            if cute.arch.warp_idx() == 0:
+                with cute.arch.elect_one():
+                    cute.arch.mbarrier_arrive_and_expect_tx(
+                        load_done + load_k_tile, expected_bytes
+                    )
+                cute.copy(
+                    tma_info_A.atom,
+                    tAgA[None, load_k_tile],
+                    tAsA[None, load_k_tile],
+                    tma_bar_ptr=load_done + load_k_tile,
+                )
+                cute.copy(
+                    tma_info_B.atom,
+                    tBgB[None, load_k_tile],
+                    tBsB[None, load_k_tile],
+                    tma_bar_ptr=load_done + load_k_tile,
+                )
 
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        mma_done = salloc.allocate_tensor(
-            cute.Int64, cute.make_layout(self.num_smem_stages), byte_alignment=8
-        ).iterator
-        if tidx == 0:
-            for stage in range_constexpr(self.num_smem_stages):
-                cute.arch.mbarrier_init(mma_done + stage, 1)
 
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
@@ -224,6 +248,7 @@ class Gemm:
             load_k_tile = k_tile + self.num_smem_stages - 1
             consume_smem_stage = consume_k_tile % self.num_smem_stages
             load_smem_stage = load_k_tile % self.num_smem_stages
+            consume_phase = (consume_k_tile // self.num_smem_stages) % 2
             # prefetch Nth
             if k_tile < num_k_tiles - self.num_smem_stages + 1:
                 # wait for free of the smem stage we are about to load into
@@ -234,23 +259,27 @@ class Gemm:
                         mma_done + load_smem_stage,
                         previous_phase,
                     )
-                cute.copy(
-                    tiled_copy,
-                    tAgA[None, None, None, load_k_tile],
-                    tAsA[None, None, None, load_smem_stage],
-                )
-                cute.copy(
-                    tiled_copy,
-                    tBgB[None, None, None, load_k_tile],
-                    tBsB[None, None, None, load_smem_stage],
-                )
-                cute.arch.cp_async_commit_group()
-                cute.arch.cp_async_wait_group(self.num_smem_stages - 1)
-            else:
-                cute.arch.cp_async_wait_group(0)
+                if cute.arch.warp_idx() == 0:
+                    with cute.arch.elect_one():
+                        cute.arch.mbarrier_arrive_and_expect_tx(
+                            load_done + load_smem_stage, expected_bytes
+                        )
+                    cute.copy(
+                        tma_info_A.atom,
+                        tAgA[None, load_k_tile],
+                        tAsA[None, load_smem_stage],
+                        tma_bar_ptr=load_done + load_smem_stage,
+                    )
+                    cute.copy(
+                        tma_info_B.atom,
+                        tBgB[None, load_k_tile],
+                        tBsB[None, load_smem_stage],
+                        tma_bar_ptr=load_done + load_smem_stage,
+                    )
 
             # signal mma that the data is ready
             cute.arch.fence_view_async_shared()
+            cute.arch.mbarrier_wait(load_done + consume_smem_stage, consume_phase)
             cute.arch.sync_threads()
 
             if cute.arch.warp_idx() == 0:
@@ -266,7 +295,7 @@ class Gemm:
 
                 with cute.arch.elect_one():
                     tcgen05.commit(mma_done + consume_smem_stage)
-                    
+
             cute.arch.sync_threads()
 
         last_tile = num_k_tiles - 1
