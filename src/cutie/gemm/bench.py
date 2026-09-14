@@ -56,6 +56,7 @@ def parse_args():
         choices=["rowwise", "super_m"],
     )
     parser.add_argument("--super_m", type=int, default=12)
+    parser.add_argument("--num_acc_stages", type=int, default=2)
 
     parser.add_argument("--M", type=int, help="Size for M dimension")
     parser.add_argument("--N", type=int, help="Size for N dimension")
@@ -111,7 +112,13 @@ def main():
     args = parse_args()
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
     gemm = Gemm(
-        args.BM, args.BN, args.BK, args.num_smem_stages, args.scheduling, args.super_m
+        args.BM,
+        args.BN,
+        args.BK,
+        args.num_smem_stages,
+        args.scheduling,
+        args.super_m,
+        args.num_acc_stages,
     )
 
     if args.M and args.N and args.K:
