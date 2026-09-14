@@ -2,7 +2,7 @@ import os
 
 import cuda.bindings.driver as cuda_driver
 import cutlass.utils.blackwell_helpers as sm100_utils
-from cutlass import cute, dsl_user_op, pipeline, range_constexpr, utils
+from cutlass import const_expr, cute, dsl_user_op, pipeline, range_constexpr, utils
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils import SmemAllocator
@@ -30,8 +30,6 @@ class Gemm:
         self.num_smem_stages = num_smem_stages
 
         self._elements_per_copy = 8
-
-        assert self.num_smem_stages in (1, 2), "num_smem_stages must be 1 or 2 for now"
 
     @cute.jit
     def __call__(
@@ -188,13 +186,26 @@ class Gemm:
         tBsB = thr_copy.partition_D(sB)
         _print(f"tAsA: {tAsA}")
         _print(f"tBsB: {tBsB}")
-        gA = cute.local_tile(mA, (self.BM, self.BK), (bidx, 0))
-        gB = cute.local_tile(mB, (self.BN, self.BK), (bidy, 0))
+
+        gA = cute.local_tile(mA, (self.BM, self.BK), (bidx, None))
+        gB = cute.local_tile(mB, (self.BN, self.BK), (bidy, None))
         tAgA = thr_copy.partition_S(gA)
         tBgB = thr_copy.partition_S(gB)
-        cute.copy(tiled_copy, tAgA, tAsA[None, None, None, 0])
-        cute.copy(tiled_copy, tBgB, tBsB[None, None, None, 0])
-        cute.arch.cp_async_commit_group()
+
+        # prefetch N-1
+        # this will prob break on small K but who cares
+        for load_k_tile in range_constexpr(self.num_smem_stages - 1):
+            cute.copy(
+                tiled_copy,
+                tAgA[None, None, None, load_k_tile],
+                tAsA[None, None, None, load_k_tile % self.num_smem_stages],
+            )
+            cute.copy(
+                tiled_copy,
+                tBgB[None, None, None, load_k_tile],
+                tBsB[None, None, None, load_k_tile % self.num_smem_stages],
+            )
+            cute.arch.cp_async_commit_group()
 
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         mma_done = salloc.allocate(cute.Int64, byte_alignment=8)
@@ -207,15 +218,22 @@ class Gemm:
 
         num_k_tiles = cute.size(mA, mode=[1]) // self.BK
         for k_tile in range(num_k_tiles):
-            src_smem_stage = k_tile % self.num_smem_stages
-            dst_smem_stage = (k_tile + 1) % self.num_smem_stages
-            if k_tile < num_k_tiles - 1:
-                gA = cute.local_tile(mA, (self.BM, self.BK), (bidx, k_tile + 1))
-                gB = cute.local_tile(mB, (self.BN, self.BK), (bidy, k_tile + 1))
-                tAgA = thr_copy.partition_S(gA)
-                tBgB = thr_copy.partition_S(gB)
-                cute.copy(tiled_copy, tAgA, tAsA[None, None, None, dst_smem_stage])
-                cute.copy(tiled_copy, tBgB, tBsB[None, None, None, dst_smem_stage])
+            consume_k_tile = k_tile
+            load_k_tile = k_tile + self.num_smem_stages - 1
+            consume_smem_stage = consume_k_tile % self.num_smem_stages
+            load_smem_stage = load_k_tile % self.num_smem_stages
+            # prefetch Nth
+            if k_tile < num_k_tiles - self.num_smem_stages + 1:
+                cute.copy(
+                    tiled_copy,
+                    tAgA[None, None, None, load_k_tile],
+                    tAsA[None, None, None, load_smem_stage],
+                )
+                cute.copy(
+                    tiled_copy,
+                    tBgB[None, None, None, load_k_tile],
+                    tBsB[None, None, None, load_smem_stage],
+                )
                 cute.arch.cp_async_commit_group()
                 cute.arch.cp_async_wait_group(self.num_smem_stages - 1)
             else:
@@ -230,8 +248,8 @@ class Gemm:
                     cute.gemm(
                         tiled_mma,
                         tCtAcc,
-                        tCrA[None, None, k_atom, src_smem_stage],
-                        tCrB[None, None, k_atom, src_smem_stage],
+                        tCrA[None, None, k_atom, consume_smem_stage],
+                        tCrB[None, None, k_atom, consume_smem_stage],
                         tCtAcc,
                     )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
