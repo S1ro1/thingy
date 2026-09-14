@@ -1,6 +1,7 @@
 import functools
 import os
 from argparse import ArgumentParser
+from typing import Literal
 
 import cuda.bindings.driver as cuda_driver
 import torch
@@ -47,6 +48,14 @@ def parse_args():
     parser.add_argument(
         "--num_smem_stages", type=int, help="Number of shared memory stages", default=1
     )
+    parser.add_argument(
+        "--scheduling",
+        type=str,
+        help="Tile scheduling strategy",
+        default="rowwise",
+        choices=["rowwise", "super_m"],
+    )
+    parser.add_argument("--super_m", type=int, default=1)
 
     parser.add_argument("--M", type=int, help="Size for M dimension")
     parser.add_argument("--N", type=int, help="Size for N dimension")
@@ -101,7 +110,9 @@ def time_us_to_tflops(time_us: float, op_flops: int) -> float:
 def main():
     args = parse_args()
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    gemm = Gemm(args.BM, args.BN, args.BK, args.num_smem_stages)
+    gemm = Gemm(
+        args.BM, args.BN, args.BK, args.num_smem_stages, args.scheduling, args.super_m
+    )
 
     if args.M and args.N and args.K:
         runnable = [(args.M, args.N, args.K)]
