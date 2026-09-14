@@ -23,12 +23,15 @@ def _print(*args, **kwargs):
 
 
 class Gemm:
-    def __init__(self, BM: int, BN: int, BK: int):
+    def __init__(self, BM: int, BN: int, BK: int, num_smem_stages: int = 1):
         self.BM = BM
         self.BN = BN
         self.BK = BK
+        self.num_smem_stages = num_smem_stages
 
         self._elements_per_copy = 8
+
+        assert self.num_smem_stages in (1, 2), "num_smem_stages must be 1 or 2 for now"
 
     @cute.jit
     def __call__(
@@ -144,8 +147,12 @@ class Gemm:
         # - with BK=128, get_smem_layout_atom_ab will choose K_SW128, where K atom is 128 bytes (64 elements wide), so for us we have 2 K tiles per swizzle atom - ((..., ...), (64, 2))
         # - with BK=64, we still get K_SW128, but now we have 1 K tile per swizzle atom - ((..., ...), (64, 1))
         # - with BK=32, we get K_SW64, where K atom is 64 bytes (32 elements wide), so we have 1 K tile per swizzle atom - ((..., ...), (32, 1))
-        layout_A = cute.tile_to_shape(smem_atom, (self.BM, self.BK), order=(1, 0))
-        layout_B = cute.tile_to_shape(smem_atom, (self.BN, self.BK), order=(1, 0))
+        layout_A = cute.tile_to_shape(
+            smem_atom, (self.BM, self.BK, self.num_smem_stages), order=(1, 0, 2)
+        )
+        layout_B = cute.tile_to_shape(
+            smem_atom, (self.BN, self.BK, self.num_smem_stages), order=(1, 0, 2)
+        )
 
         # allocate with outer/inner
         sA = salloc.allocate_tensor(
@@ -179,8 +186,15 @@ class Gemm:
 
         tAsA = thr_copy.partition_D(sA)
         tBsB = thr_copy.partition_D(sB)
-        # tArA = cute.make_rmem_tensor_like(tAsA)
-        # tBrB = cute.make_rmem_tensor_like(tBsB)
+        _print(f"tAsA: {tAsA}")
+        _print(f"tBsB: {tBsB}")
+        gA = cute.local_tile(mA, (self.BM, self.BK), (bidx, 0))
+        gB = cute.local_tile(mB, (self.BN, self.BK), (bidy, 0))
+        tAgA = thr_copy.partition_S(gA)
+        tBgB = thr_copy.partition_S(gB)
+        cute.copy(tiled_copy, tAgA, tAsA[None, None, None, 0])
+        cute.copy(tiled_copy, tBgB, tBsB[None, None, None, 0])
+        cute.arch.cp_async_commit_group()
 
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
         mma_done = salloc.allocate(cute.Int64, byte_alignment=8)
@@ -191,17 +205,21 @@ class Gemm:
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
-        for k_tile in range(cute.size(mA, mode=[1]) // self.BK):
-            gA = cute.local_tile(mA, (self.BM, self.BK), (bidx, k_tile))
-            gB = cute.local_tile(mB, (self.BN, self.BK), (bidy, k_tile))
-            tAgA = thr_copy.partition_S(gA)
-            tBgB = thr_copy.partition_S(gB)
-
-            cute.copy(tiled_copy, tAgA, tAsA)
-            cute.copy(tiled_copy, tBgB, tBsB)
-
-            cute.arch.cp_async_commit_group()
-            cute.arch.cp_async_wait_group(0)
+        num_k_tiles = cute.size(mA, mode=[1]) // self.BK
+        for k_tile in range(num_k_tiles):
+            src_smem_stage = k_tile % self.num_smem_stages
+            dst_smem_stage = (k_tile + 1) % self.num_smem_stages
+            if k_tile < num_k_tiles - 1:
+                gA = cute.local_tile(mA, (self.BM, self.BK), (bidx, k_tile + 1))
+                gB = cute.local_tile(mB, (self.BN, self.BK), (bidy, k_tile + 1))
+                tAgA = thr_copy.partition_S(gA)
+                tBgB = thr_copy.partition_S(gB)
+                cute.copy(tiled_copy, tAgA, tAsA[None, None, None, dst_smem_stage])
+                cute.copy(tiled_copy, tBgB, tBsB[None, None, None, dst_smem_stage])
+                cute.arch.cp_async_commit_group()
+                cute.arch.cp_async_wait_group(self.num_smem_stages - 1)
+            else:
+                cute.arch.cp_async_wait_group(0)
 
             # signal mma that the data is ready
             cute.arch.fence_view_async_shared()
@@ -212,8 +230,8 @@ class Gemm:
                     cute.gemm(
                         tiled_mma,
                         tCtAcc,
-                        tCrA[None, None, k_atom],
-                        tCrB[None, None, k_atom],
+                        tCrA[None, None, k_atom, src_smem_stage],
+                        tCrB[None, None, k_atom, src_smem_stage],
                         tCtAcc,
                     )
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
