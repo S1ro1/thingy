@@ -43,7 +43,11 @@ def parse_args():
     parser.add_argument(
         "--BN", type=int, help="Block size for N dimension", default=256
     )
-    parser.add_argument("--BK", type=int, help="Block size for K dimension", default=32)
+    parser.add_argument("--BK", type=int, help="Block size for K dimension", default=64)
+
+    parser.add_argument("--M", type=int, help="Size for M dimension")
+    parser.add_argument("--N", type=int, help="Size for N dimension")
+    parser.add_argument("--K", type=int, help="Size for K dimension")
 
     return parser.parse_args()
 
@@ -94,9 +98,14 @@ def time_us_to_tflops(time_us: float, op_flops: int) -> float:
 def main():
     args = parse_args()
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    gemm = Gemm(**vars(args))
+    gemm = Gemm(args.BM, args.BN, args.BK)
 
-    for M, N, K in test_configs:
+    if args.M and args.N and args.K:
+        runnable = [(args.M, args.N, args.K)]
+    else:
+        runnable = test_configs
+
+    for M, N, K in runnable:
         inputs = workspace_generator(M, N, K)
         flops = gemm_flops(M, N, K)
 
