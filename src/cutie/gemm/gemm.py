@@ -208,10 +208,12 @@ class Gemm:
             cute.arch.cp_async_commit_group()
 
         tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
-        mma_done = salloc.allocate(cute.Int64, byte_alignment=8)
-        phase = 0
+        mma_done = salloc.allocate_tensor(
+            cute.Int64, cute.make_layout(self.num_smem_stages), byte_alignment=8
+        ).iterator
         if tidx == 0:
-            cute.arch.mbarrier_init(mma_done, 1)
+            for stage in range_constexpr(self.num_smem_stages):
+                cute.arch.mbarrier_init(mma_done + stage, 1)
 
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
@@ -224,6 +226,14 @@ class Gemm:
             load_smem_stage = load_k_tile % self.num_smem_stages
             # prefetch Nth
             if k_tile < num_k_tiles - self.num_smem_stages + 1:
+                # wait for free of the smem stage we are about to load into
+                if load_k_tile >= self.num_smem_stages:
+                    previous_tile = load_k_tile - self.num_smem_stages
+                    previous_phase = (previous_tile // self.num_smem_stages) % 2
+                    cute.arch.mbarrier_wait(
+                        mma_done + load_smem_stage,
+                        previous_phase,
+                    )
                 cute.copy(
                     tiled_copy,
                     tAgA[None, None, None, load_k_tile],
@@ -255,12 +265,14 @@ class Gemm:
                     tiled_mma.set(tcgen05.Field.ACCUMULATE, True)
 
                 with cute.arch.elect_one():
-                    tcgen05.commit(mma_done)
-
-            # wait for MMA to finish before we start the next iteration
-            cute.arch.mbarrier_wait(mma_done, phase)
-            phase ^= 1
+                    tcgen05.commit(mma_done + consume_smem_stage)
+                    
             cute.arch.sync_threads()
+
+        last_tile = num_k_tiles - 1
+        last_stage = (num_k_tiles - 1) % self.num_smem_stages
+        last_phase = (last_tile // self.num_smem_stages) % 2
+        cute.arch.mbarrier_wait(mma_done + last_stage, last_phase)
 
         fence_after_thread_sync()
         # tmem to reg
