@@ -1,7 +1,6 @@
 import functools
 import os
 from argparse import ArgumentParser
-from typing import Literal
 
 import cuda.bindings.driver as cuda_driver
 import torch
@@ -46,7 +45,7 @@ def parse_args():
     )
     parser.add_argument("--BK", type=int, help="Block size for K dimension", default=64)
     parser.add_argument(
-        "--num_smem_stages", type=int, help="Number of shared memory stages", default=1
+        "--num_smem_stages", type=int, help="Number of shared memory stages", default=4
     )
     parser.add_argument(
         "--scheduling",
@@ -57,6 +56,7 @@ def parse_args():
     )
     parser.add_argument("--super_m", type=int, default=12)
     parser.add_argument("--num_acc_stages", type=int, default=2)
+    parser.add_argument("--num_m_ctas", type=int, default=1)
 
     parser.add_argument("--M", type=int, help="Size for M dimension")
     parser.add_argument("--N", type=int, help="Size for N dimension")
@@ -119,6 +119,7 @@ def main():
         args.scheduling,
         args.super_m,
         args.num_acc_stages,
+        args.num_m_ctas,
     )
 
     if args.M and args.N and args.K:
