@@ -1,6 +1,8 @@
 import functools
 import os
 from argparse import ArgumentParser
+from dataclasses import asdict, dataclass
+from itertools import product
 
 import cuda.bindings.driver as cuda_driver
 import torch
@@ -34,6 +36,39 @@ test_configs = [
 ]
 
 
+@dataclass(frozen=True)
+class Config:
+    BM: int
+    BN: int
+    BK: int
+    num_smem_stages: int
+    scheduling: str
+    super_m: int
+    num_acc_stages: int
+    num_m_ctas: int
+
+
+def candidate_configs(M, N, K, smem_capacity, num_sms):
+    """Search the requested bounded space, filtering unsupported geometries."""
+    # A one-CTA MMA supports M=128; two-CTA MMA supports M=128 or M=256.
+    geometries = product(((1, 128), (2, 128), (2, 256)), (128, 256), (32, 64))
+    for (ctas, bm), bn, bk in geometries:
+        if M % bm or N % bn or K % bk or num_sms % ctas:
+            continue
+        # BF16 A/B are both partitioned across the CTA pair. Reserve space for
+        # alignment, pipeline barriers, and the TMEM allocator's bookkeeping.
+        bytes_per_stage = (bm + bn) * bk * 2 // ctas
+        max_stages = min(K // bk, (smem_capacity - 2048) // bytes_per_stage)
+        stages = [s for s in (1, 4) if s <= max_stages]
+        # Each FP32 accumulator uses BN columns; TMEM has 512 per SM.
+        accumulators = [a for a in (2,) if bn * a <= 512]
+        for smem_stages, acc_stages, group in product(stages, accumulators, (4, 8, 12)):
+            yield Config(
+                bm, bn, bk, smem_stages,
+                "super_m", group, acc_stages, ctas,
+            )
+
+
 def parse_args():
     parser = ArgumentParser(description="Run GEMM benchmark")
 
@@ -57,12 +92,21 @@ def parse_args():
     parser.add_argument("--super_m", type=int, default=12)
     parser.add_argument("--num_acc_stages", type=int, default=2)
     parser.add_argument("--num_m_ctas", type=int, default=1)
+    parser.add_argument(
+        "--find_best_config", "--find_config", dest="find_best_config",
+        action="store_true",
+        help="Search valid GEMM configurations per shape (overrides tile/path options)",
+    )
 
     parser.add_argument("--M", type=int, help="Size for M dimension")
     parser.add_argument("--N", type=int, help="Size for N dimension")
     parser.add_argument("--K", type=int, help="Size for K dimension")
 
-    return parser.parse_args()
+    args = parser.parse_args()
+    dims = (args.M, args.N, args.K)
+    if any(d is not None for d in dims) and not all(d is not None and d > 0 for d in dims):
+        parser.error("provide positive --M, --N, and --K together")
+    return args
 
 
 def gemm_reference(
@@ -111,7 +155,7 @@ def time_us_to_tflops(time_us: float, op_flops: int) -> float:
 def main():
     args = parse_args()
     stream = cuda_driver.CUstream(torch.cuda.current_stream().cuda_stream)
-    gemm = Gemm(
+    selected_config = Config(
         args.BM,
         args.BN,
         args.BK,
@@ -135,11 +179,6 @@ def main():
             inputs.kwargs["A"], inputs.kwargs["B"], inputs.kwargs["out"]
         )
 
-        cutie_gemm = cute.compile(
-            gemm, A=A_cute, B=B_cute, out=out_cute, stream=make_fake_stream()
-        )
-        cutie_gemm = functools.partial(cutie_gemm, stream=stream)
-
         # from_dlpack shares storage: out_cute writes into inputs.kwargs["out"].
         # Keep the reference in a separate allocation so the kernel cannot
         # overwrite it (or inherit correct values for elements it never writes).
@@ -148,13 +187,6 @@ def main():
             inputs.kwargs["B"],
             out=torch.empty_like(inputs.kwargs["out"]),
         )
-        inputs.kwargs["out"].fill_(float("nan"))
-        cutie_gemm(A_cute, B_cute, out_cute)
-
-        is_correct = torch.allclose(
-            baseline_result, inputs.kwargs["out"], rtol=1e-2, atol=1e-2
-        )
-
         time_us_reference = benchmark(
             gemm_reference,
             workspace_generator=functools.partial(
@@ -163,19 +195,64 @@ def main():
             stream=stream,
         )
 
-        time_us_cutie = benchmark(
-            cutie_gemm,
-            workspace_generator=functools.partial(
-                workspace_generator, M=M, N=N, K=K, to_cute=True
-            ),
-            stream=stream,
-        )
-
         tflops_reference = time_us_to_tflops(time_us_reference, flops)
-        tflops_cutie = time_us_to_tflops(time_us_cutie, flops)
-        print(
-            f"gemm({M}, {N}, {K}) | {'✅' if is_correct else '❌'} | Torch: {tflops_reference:.2f} TFLOPS | Cutie: {tflops_cutie:.2f} TFLOPS | Speedup: {(tflops_cutie / tflops_reference):.2f}X"
-        )
+        configs = [selected_config]
+        if args.find_best_config:
+            device = torch.cuda.get_device_properties(torch.cuda.current_device())
+            configs = list(candidate_configs(
+                M, N, K, device.shared_memory_per_block_optin, device.multi_processor_count
+            ))
+
+        best_config, best_time = None, float("inf")
+        for config in configs:
+            if M % config.BM or N % config.BN or K % config.BK:
+                raise ValueError("M, N, K must be divisible by BM, BN, BK")
+            try:
+                cutie_gemm = cute.compile(
+                    Gemm(**asdict(config)), A=A_cute, B=B_cute, out=out_cute,
+                    stream=make_fake_stream(),
+                )
+            except Exception:
+                if not args.find_best_config:
+                    raise
+                continue
+
+            cutie_gemm = functools.partial(cutie_gemm, stream=stream)
+            inputs.kwargs["out"].fill_(float("nan"))
+            # Runtime CUDA failures propagate: continuing with a poisoned device
+            # context would make subsequent candidate results unreliable.
+            cutie_gemm(A_cute, B_cute, out_cute)
+            is_correct = torch.allclose(
+                baseline_result, inputs.kwargs["out"], rtol=1e-2, atol=1e-2
+            )
+            if not is_correct:
+                if not args.find_best_config:
+                    raise AssertionError("Kernel output does not match PyTorch")
+                continue
+
+            time_us_cutie = benchmark(
+                cutie_gemm,
+                workspace_generator=functools.partial(
+                    workspace_generator, M=M, N=N, K=K, to_cute=True
+                ),
+                stream=stream,
+            )
+            tflops_cutie = time_us_to_tflops(time_us_cutie, flops)
+            if not args.find_best_config:
+                print(
+                    f"gemm({M}, {N}, {K}) | ✅ | Torch: {tflops_reference:.2f} TFLOPS | Cutie: {tflops_cutie:.2f} TFLOPS | Speedup: {(tflops_cutie / tflops_reference):.2f}X"
+                )
+            if time_us_cutie < best_time:
+                best_config, best_time = config, time_us_cutie
+
+        if args.find_best_config:
+            if best_config is None:
+                raise RuntimeError(f"No correct, benchmarkable config for M={M}, N={N}, K={K}")
+            print(
+                f"Best config for M={M}, N={N}, K={K}: {best_config} | "
+                f"{best_time:.3f} us | {time_us_to_tflops(best_time, flops):.2f} TFLOPS | "
+                f"Speedup: {time_us_reference / best_time:.2f}X", flush=True,
+            )
 
         if os.environ.get("DEBUG", "0") == "1":
             break

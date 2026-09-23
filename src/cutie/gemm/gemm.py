@@ -203,6 +203,10 @@ class Gemm:
     ):
         salloc = SmemAllocator()
 
+        if cute.arch.warp_idx() == self.tma_warp_id:
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_info_A.atom)
+            cute.nvgpu.cpasync.prefetch_descriptor(tma_info_B.atom)
+
         bidx, _, _ = cute.arch.block_idx()
         tidx, _, _ = cute.arch.thread_idx()
         num_ctas, _, _ = cute.arch.grid_dim()
