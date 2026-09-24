@@ -176,9 +176,11 @@ class Gemm:
             (self.BN // self.num_m_ctas, self.BK),
         )
 
-        num_ctas = utils.HardwareInfo(0).get_device_multiprocessor_count()
+        num_tiles = (cute.size(out, mode=[0]) // self.BM) * (
+            cute.size(out, mode=[1]) // self.BN
+        )
         block = (192, 1, 1)
-        grid = (num_ctas, 1, 1)
+        grid = (num_tiles * self.num_m_ctas, 1, 1)
         cluster = (self.num_m_ctas, 1, 1)
         self.epilogue_warp_id = (0, 1, 2, 3)
         self.tma_warp_id = 4
@@ -268,6 +270,14 @@ class Gemm:
         acc_ready = salloc.allocate_tensor(
             cute.Int64, cute.make_layout(self.num_acc_stages), byte_alignment=8
         ).iterator
+        next_tile_ready = salloc.allocate_tensor(
+            cute.Int64, cute.make_layout(1), byte_alignment=8
+        ).iterator
+
+        next_tile_response = salloc.allocate_tensor(
+            cute.Int32, cute.make_layout(4), byte_alignment=16
+        ).iterator
+
         expected_bytes = ((self.BM + self.BN) * self.BK * mA.element_type.width) // 8
         if tidx == 0:
             for stage in range_constexpr(self.num_smem_stages):
@@ -278,6 +288,8 @@ class Gemm:
                 cute.arch.mbarrier_init(acc_empty + stage, 4 * self.num_m_ctas)
                 cute.arch.mbarrier_init(acc_ready + stage, 1)
 
+            cute.arch.mbarrier_init(next_tile_ready, 1)
+
         cute.arch.mbarrier_init_fence()
         cute.arch.sync_threads()
 
@@ -287,7 +299,6 @@ class Gemm:
         _print(f"tCrB: {tCrB}")
 
         tile_idx = bidx // self.num_m_ctas
-        num_clusters = num_ctas // self.num_m_ctas
         total_output_tiles = (cute.size(mC, mode=[0]) // self.BM) * (
             cute.size(mC, mode=[1]) // self.BN
         )
@@ -300,12 +311,15 @@ class Gemm:
         bidx, bidy = 0, 0
         acc_stage = 0
         t = 0
+        tile_phase = 0
 
         cute.arch.mbarrier_init_fence()
         cute.arch.cluster_arrive()
         cute.arch.cluster_wait()
 
-        while tile_idx < total_output_tiles:
+        has_work = cutlass.Boolean(True)
+
+        while has_work:
             acc_stage = t % self.num_acc_stages
             acc_phase = (t // self.num_acc_stages) % 2
 
@@ -455,7 +469,33 @@ class Gemm:
                 cute.autovec_copy(rC, tDgC)
 
             pipeline_base += num_k_tiles
-            tile_idx += num_clusters
+
+            if tidx == 0:
+                cute.arch.mbarrier_arrive_and_expect_tx(next_tile_ready, 16)
+
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+
+            if cluster_cta_idx == self.leader_cta_id and tidx == 0:
+                cute.arch.issue_clc_query(
+                    mbar_ptr=next_tile_ready,
+                    clc_response_ptr=next_tile_response,
+                    multicast=True,
+                )
+
+            cute.arch.mbarrier_wait(next_tile_ready, phase=tile_phase)
+            tile_phase ^= 1
+
+            x, _, _, valid = cute.arch.clc_response(next_tile_response)
+
+            cute.arch.fence_proxy("async.shared", space="cta")
+            cute.arch.cluster_arrive()
+            cute.arch.cluster_wait()
+
+            has_work = cutlass.Boolean(valid)
+            if has_work:
+                tile_idx = x // self.num_m_ctas
+
             t += 1
 
         cute.arch.sync_threads()
