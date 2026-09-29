@@ -1,0 +1,8 @@
+[
+  {
+    "label": "Kittie: build",
+    "command": "make",
+    "args": ["-C", "src/kittie/gemm"],
+    "cwd": "$ZED_WORKTREE_ROOT"
+  }
+]

@@ -7,6 +7,7 @@ from cutlass import const_expr, cute, dsl_user_op, pipeline, range_constexpr, ut
 from cutlass._mlir.dialects import nvvm
 from cutlass.cute.nvgpu import tcgen05
 from cutlass.utils import SmemAllocator
+from cutlass.utils.gemm.sm100 import transform_partitioned_tensor_layout
 
 
 @dsl_user_op
@@ -34,6 +35,7 @@ class Gemm:
         super_m: int = 1,
         num_acc_stages: int = 1,
         num_m_ctas: int = 1,
+        num_epi_stages: int = 1,
     ):
         self.BM = BM
         self.BN = BN
@@ -43,6 +45,7 @@ class Gemm:
         self.super_m = super_m
         self.num_acc_stages = num_acc_stages
         self.num_m_ctas = num_m_ctas
+        self.num_epi_stages = num_epi_stages
         self.num_clc_stages = 2
 
         if super_m != 1 and scheduling != "super_m":
@@ -144,6 +147,16 @@ class Gemm:
         smem_layout_B = sm100_utils.make_smem_layout_b(
             tiled_mma, (self.BM, self.BN, self.BK), B.element_type, self.num_smem_stages
         )
+        epi_tiler = sm100_utils.compute_epilogue_tile_shape(
+            (self.BM // self.num_m_ctas, self.BN, self.BK),
+            self.num_m_ctas == 2, utils.LayoutEnum.ROW_MAJOR, out.element_type,
+        )
+        smem_layout_C = sm100_utils.make_smem_layout_epi(
+            out.element_type,
+            sm100_utils.LayoutEnum.ROW_MAJOR,
+            epi_tile=epi_tiler,
+            epi_stage=self.num_epi_stages,
+        )
 
         def _group_modes(_layout: cute.ComposedLayout) -> cute.ComposedLayout:
             _layout = cute.select(_layout, mode=[0, 1, 2])
@@ -176,6 +189,12 @@ class Gemm:
             nk_layout,
             (self.BN // self.num_m_ctas, self.BK),
         )
+        tma_info_C = cute.nvgpu.cpasync.make_tiled_tma_atom(
+            cute.nvgpu.cpasync.CopyBulkTensorTileS2GOp(),
+            out,
+            cute.select(smem_layout_C, mode=[0, 1]),
+            epi_tiler,
+        )
 
         num_tiles = (cute.size(out, mode=[0]) // self.BM) * (
             cute.size(out, mode=[1]) // self.BN
@@ -189,7 +208,17 @@ class Gemm:
         self.clc_warp_id = 6
         self.leader_cta_id = 0
         self.gemm_kernel(
-            A, B, out, tma_info_A, tma_info_B, smem_layout_A, smem_layout_B, tiled_mma
+            A,
+            B,
+            out,
+            tma_info_A,
+            tma_info_B,
+            tma_info_C,
+            smem_layout_A,
+            smem_layout_B,
+            smem_layout_C,
+            epi_tiler,
+            tiled_mma,
         ).launch(grid=grid, block=block, stream=stream, cluster=cluster)
 
     @cute.kernel
@@ -200,9 +229,12 @@ class Gemm:
         mC: cute.Tensor,
         tma_info_A: cute.nvgpu.cpasync.TmaInfo,
         tma_info_B: cute.nvgpu.cpasync.TmaInfo,
+        tma_info_C: cute.nvgpu.cpasync.TmaInfo,
         # we need to pass these as tma_info.smem_layout loses the notion of stages
         smem_layout_A: cute.ComposedLayout,
         smem_layout_B: cute.ComposedLayout,
+        smem_layout_C: cute.ComposedLayout,
+        epi_tiler: cute.Tile,
         tiled_mma: cute.TiledMma,
     ):
         salloc = SmemAllocator()
@@ -217,6 +249,9 @@ class Gemm:
 
         bdimx, _, _ = cute.arch.block_dim()
         num_warps = (bdimx // cute.arch.WARP_SIZE) * self.num_m_ctas
+
+        # Only the four epilogue warps participate; other roles run independently.
+        epi_barrier = pipeline.NamedBarrier(barrier_id=2, num_threads=128)
 
         cluster_mask = None
         cta_group = tcgen05.CtaGroup.ONE
@@ -242,12 +277,24 @@ class Gemm:
         tmem_ptr = tmem.retrieve_ptr(cute.Float32)
         tCtAcc_base = cute.make_tensor(tmem_ptr, acc_fragment.layout)
 
-        tmem_atom = cute.make_copy_atom(
-            tcgen05.Ld32x32bOp(tcgen05.Repetition.x32),
-            cute.Float32,
+        # Partition the accumulator into epilogue subtiles before assigning
+        # threads. The SMEM copy will inherit this ownership through retile().
+        tAcc_epi = cute.flat_divide(
+            transform_partitioned_tensor_layout(tCtAcc_base), epi_tiler
         )
-        tmem_copy = tcgen05.make_tmem_copy(tmem_atom, tCtAcc_base[None, None, None, 0])
+        tmem_atom = sm100_utils.get_tmem_load_op(
+            (self.BM // self.num_m_ctas, self.BN, self.BK),
+            utils.LayoutEnum.ROW_MAJOR, mC.element_type, cute.Float32,
+            epi_tiler, self.num_m_ctas == 2,
+        )
+        tmem_copy = tcgen05.make_tmem_copy(
+            tmem_atom, tAcc_epi[None, None, 0, 0, 0]
+        )
         thr_tmem = tmem_copy.get_slice(tidx)
+        smem_atom = sm100_utils.get_smem_store_op(
+            utils.LayoutEnum.ROW_MAJOR, mC.element_type, cute.Float32, tmem_copy
+        )
+        smem_copy = cute.make_tiled_copy_D(smem_atom, tmem_copy)
 
         # allocate with outer/inner
         tCsA = salloc.allocate_tensor(
@@ -262,6 +309,14 @@ class Gemm:
             byte_alignment=1024,
             swizzle=smem_layout_B.inner,
         )
+
+        sC = salloc.allocate_tensor(
+            mC.element_type,
+            smem_layout_C.outer,
+            byte_alignment=1024,
+            swizzle=smem_layout_C.inner,
+        )
+
         mma_done = salloc.allocate_tensor(
             cute.Int64, cute.make_layout(self.num_smem_stages), byte_alignment=8
         ).iterator
@@ -280,7 +335,6 @@ class Gemm:
         next_clc_empty = salloc.allocate_tensor(
             cute.Int64, cute.make_layout(self.num_clc_stages), byte_alignment=8
         ).iterator
-
         next_clc_response = salloc.allocate_tensor(
             cute.Int128, cute.make_layout(self.num_clc_stages), byte_alignment=16
         ).iterator
@@ -350,6 +404,12 @@ class Gemm:
             # ((N_atom, K_atom), MMA_N, MMA_K, num_k_tiles)
             tCgB = thr_mma.partition_B(gB)
 
+            gC = cute.local_tile(
+                tma_info_C.tma_tensor,
+                (self.BM // self.num_m_ctas, self.BN),
+                (bidx * self.num_m_ctas + cluster_cta_idx, bidy),
+            )
+
             tAsA, tAgA = cute.nvgpu.cpasync.tma_partition(
                 tma_info_A.atom,
                 0,
@@ -364,19 +424,21 @@ class Gemm:
                 cute.group_modes(tCsB, 0, 3),
                 cute.group_modes(tCgB, 0, 3),
             )
-            gC = cute.local_tile(mC, (self.BM, self.BN), (bidx, bidy))
 
-            # 1. we partition with mma gC for the portion that this mma will compute
-            tCgC = thr_mma.partition_C(gC)
-            # 2. we partition with thr_tmem the tmem accumulator
-            tDtC = thr_tmem.partition_S(tCtAcc)
-            # 3. we FURTHER partition the local accumulator for epilogue copies
-            tDgC = thr_tmem.partition_D(tCgC)
-
-            # accum dtype fp32, we copy from tmem to registers
+            tDtC = thr_tmem.partition_S(tAcc_epi[None, None, None, None, acc_stage])
+            tDtC = cute.group_modes(tDtC, 3, cute.rank(tDtC))
+            tDgC = thr_tmem.partition_D(cute.flat_divide(gC, epi_tiler))
+            tDgC = cute.group_modes(tDgC, 3, cute.rank(tDgC))
             rAcc = cute.make_rmem_tensor(tDgC.shape, cute.Float32)
-            # output dtype bf16, we copy from reg to reg
             rC = cute.make_rmem_tensor(tDgC.shape, mC.element_type)
+            tRsC = smem_copy.retile(rC)
+            tSsC = smem_copy.get_slice(tidx).partition_D(sC)
+            tma_sC, tma_gC = cute.nvgpu.cpasync.tma_partition(
+                tma_info_C.atom, 0, cute.make_layout(1),
+                cute.group_modes(sC, 0, 2),
+                cute.group_modes(cute.flat_divide(gC, epi_tiler), 0, 2),
+            )
+            tma_gC = cute.group_modes(tma_gC, 1, cute.rank(tma_gC))
             tiled_mma.set(tcgen05.Field.ACCUMULATE, False)
 
             # wait for the current epilogue tmem to be empty
@@ -472,8 +534,26 @@ class Gemm:
 
                 # cast to bf16 in registers
                 rC.store(rAcc.load().to(mC.element_type))
-                # copy to destination
-                cute.autovec_copy(rC, tDgC)
+
+                for epi_tile in range_constexpr(cute.size(tDtC, mode=[3])):
+                    stage = epi_tile % self.num_epi_stages
+                    if cute.arch.warp_idx() == 0:
+                        cute.arch.cp_async_bulk_wait_group(self.num_epi_stages - 1, read=True)
+                    epi_barrier.arrive_and_wait()  # previous TMA reads are done
+
+                    cute.copy(
+                        smem_copy, tRsC[None, None, None, epi_tile],
+                        tSsC[None, None, None, stage],
+                    )
+                    cute.arch.fence_proxy("async.shared", space="cta")
+                    epi_barrier.arrive_and_wait()  # SMEM writes are visible to TMA
+                    if cute.arch.warp_idx() == 0:
+                        cute.copy(tma_info_C.atom, tma_sC[None, stage], tma_gC[None, epi_tile])
+                        cute.arch.cp_async_bulk_commit_group()
+
+                if cute.arch.warp_idx() == 0:
+                    cute.arch.cp_async_bulk_wait_group(0, read=False)
+                epi_barrier.arrive_and_wait()
 
             pipeline_base += num_k_tiles
 

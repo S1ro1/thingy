@@ -1,0 +1,3 @@
+[submodule "kittie/third_party/ThunderKittens"]
+	path = src/kittie/third_party/ThunderKittens
+	url = https://github.com/HazyResearch/ThunderKittens.git

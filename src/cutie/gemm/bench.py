@@ -64,8 +64,14 @@ def candidate_configs(M, N, K, smem_capacity, num_sms):
         accumulators = [a for a in (2,) if bn * a <= 512]
         for smem_stages, acc_stages, group in product(stages, accumulators, (4, 8, 12)):
             yield Config(
-                bm, bn, bk, smem_stages,
-                "super_m", group, acc_stages, ctas,
+                bm,
+                bn,
+                bk,
+                smem_stages,
+                "super_m",
+                group,
+                acc_stages,
+                ctas,
             )
 
 
@@ -92,8 +98,11 @@ def parse_args():
     parser.add_argument("--super_m", type=int, default=12)
     parser.add_argument("--num_acc_stages", type=int, default=2)
     parser.add_argument("--num_m_ctas", type=int, default=1)
+    parser.add_argument("--num_epi_stages", type=int, default=1)
     parser.add_argument(
-        "--find_best_config", "--find_config", dest="find_best_config",
+        "--find_best_config",
+        "--find_config",
+        dest="find_best_config",
         action="store_true",
         help="Search valid GEMM configurations per shape (overrides tile/path options)",
     )
@@ -104,7 +113,9 @@ def parse_args():
 
     args = parser.parse_args()
     dims = (args.M, args.N, args.K)
-    if any(d is not None for d in dims) and not all(d is not None and d > 0 for d in dims):
+    if any(d is not None for d in dims) and not all(
+        d is not None and d > 0 for d in dims
+    ):
         parser.error("provide positive --M, --N, and --K together")
     return args
 
@@ -199,9 +210,15 @@ def main():
         configs = [selected_config]
         if args.find_best_config:
             device = torch.cuda.get_device_properties(torch.cuda.current_device())
-            configs = list(candidate_configs(
-                M, N, K, device.shared_memory_per_block_optin, device.multi_processor_count
-            ))
+            configs = list(
+                candidate_configs(
+                    M,
+                    N,
+                    K,
+                    device.shared_memory_per_block_optin,
+                    device.multi_processor_count,
+                )
+            )
 
         best_config, best_time = None, float("inf")
         for config in configs:
@@ -209,7 +226,10 @@ def main():
                 raise ValueError("M, N, K must be divisible by BM, BN, BK")
             try:
                 cutie_gemm = cute.compile(
-                    Gemm(**asdict(config)), A=A_cute, B=B_cute, out=out_cute,
+                    Gemm(**asdict(config)),
+                    A=A_cute,
+                    B=B_cute,
+                    out=out_cute,
                     stream=make_fake_stream(),
                 )
             except Exception:
@@ -247,11 +267,14 @@ def main():
 
         if args.find_best_config:
             if best_config is None:
-                raise RuntimeError(f"No correct, benchmarkable config for M={M}, N={N}, K={K}")
+                raise RuntimeError(
+                    f"No correct, benchmarkable config for M={M}, N={N}, K={K}"
+                )
             print(
                 f"Best config for M={M}, N={N}, K={K}: {best_config} | "
                 f"{best_time:.3f} us | {time_us_to_tflops(best_time, flops):.2f} TFLOPS | "
-                f"Speedup: {time_us_reference / best_time:.2f}X", flush=True,
+                f"Speedup: {time_us_reference / best_time:.2f}X",
+                flush=True,
             )
 
         if os.environ.get("DEBUG", "0") == "1":

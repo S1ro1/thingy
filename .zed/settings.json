@@ -1,0 +1,13 @@
+{
+  "file_types": {
+    "C++": ["cu", "cuh"]
+  },
+  "lsp": {
+    "clangd": {
+      "binary": {
+        "path": "/root/.local/bin/clangd",
+        "arguments": ["--background-index", "--header-insertion=never"]
+      }
+    }
+  }
+}
