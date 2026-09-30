@@ -45,6 +45,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    debug = os.environ.get('DEBUG', '0') == '1'
     extension = load_extension()
     torch_stream = torch.cuda.current_stream()
     stream = cuda_driver.CUstream(torch_stream.cuda_stream)
@@ -65,20 +66,27 @@ def main():
             out=torch.empty_like(inputs.kwargs['out']),
         )
         workspace = functools.partial(workspace_generator, M=M, N=N, K=K)
-        time_us_reference = benchmark(
-            gemm_reference, workspace_generator=workspace, stream=stream,
-        )
-        tflops_reference = time_us_to_tflops(time_us_reference, flops)
+        if not debug:
+            time_us_reference = benchmark(
+                gemm_reference, workspace_generator=workspace, stream=stream,
+            )
+            tflops_reference = time_us_to_tflops(time_us_reference, flops)
 
         if M % extension.BM or N % extension.BN or K % extension.BK:
             raise ValueError('M, N, K must be divisible by BM, BN, BK')
         inputs.kwargs['out'].fill_(float('nan'))
         kittie_gemm(**inputs.kwargs)
+        if debug:
+            torch_stream.synchronize()  # Flush device printf after the single launch.
         is_correct = torch.allclose(
             baseline_result, inputs.kwargs['out'], rtol=1e-2, atol=1e-2,
         )
         if not is_correct:
             raise AssertionError('Kernel output does not match PyTorch')
+
+        if debug:
+            print(f'gemm({M}, {N}, {K}) | ✅ | DEBUG: single launch, timing skipped')
+            break
 
         time_us_kittie = benchmark(
             kittie_gemm, workspace_generator=workspace, stream=stream,
@@ -88,9 +96,6 @@ def main():
             f'gemm({M}, {N}, {K}) | ✅ | Torch: {tflops_reference:.2f} TFLOPS | '
             f'Kittie: {tflops_kittie:.2f} TFLOPS | Speedup: {(tflops_kittie / tflops_reference):.2f}X'
         )
-
-        if os.environ.get('DEBUG', '0') == '1':
-            break
 
 
 if __name__ == '__main__':

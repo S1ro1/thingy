@@ -8,6 +8,9 @@ TK := $(ROOT)/src/kittie/third_party/ThunderKittens
 OUT := _C$(shell $(PYTHON) -c 'import sysconfig; print(sysconfig.get_config_var("EXT_SUFFIX"))')
 PY_INCLUDES := $(shell $(PYTHON) -m pybind11 --includes)
 DEFINES := -DKITTENS_SM$(subst a,,$(ARCH)) -DNDEBUG
+ifeq ($(DEBUG),1)
+DEFINES += -DKITTIE_DEBUG
+endif
 DEFINES += -D__CUDA_NO_HALF_OPERATORS__ -D__CUDA_NO_HALF_CONVERSIONS__
 DEFINES += -D__CUDA_NO_BFLOAT16_CONVERSIONS__ -D__CUDA_NO_HALF2_OPERATORS__
 # Avoid the generic PTX fallback from -arch: tcgen05 requires the "a" target.

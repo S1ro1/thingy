@@ -25,7 +25,12 @@ These commands automatically perform an incremental build. The benchmark follows
 Cutie's normal flow: generate inputs, time PyTorch, check kernel output against
 the reference, then time the kernel and report TFLOPS and speedup. It reuses the
 same input generation, tolerance, and timing with rotating workspaces.
-The empty starter fails the same correctness check. `DEBUG=1` runs one shape.
+`DEBUG=1` runs one shape with a single kernel launch and correctness check,
+synchronizes to flush device prints, and skips timing. In device code,
+`DEBUG_PRINT("tile=%d\n", tile)` prints from thread 0 of CTA 0;
+`DEBUG_PRINT_IF(condition, "tile=%d\n", tile)` selects a different caller.
+Both macros compile to no-ops unless built with `DEBUG=1`. The benchmark forwards
+the environment to `make`, which rebuilds automatically when this setting changes.
 
 Set `BM`, `BN`, `BK`, and `NUM_WARPS` in `gemm.cu`. Initially M/N/K must be divisible by
 BM/BN/BK respectively. The grid assigns one output tile to each CTA; persistence
