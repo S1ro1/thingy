@@ -54,7 +54,7 @@ def workspace_generator(seq_len, num_documents, seed):
             selected += start
             selected.masked_fill_(~values.isfinite(), seq_len)
             indices[0, start + lo:start + hi, 0, :selected.shape[-1]] = selected
-    return dict(q=q, kv=kv, indices=indices)
+    return {"q": q, "kv": kv, "indices": indices}
 
 
 def load_extension():
@@ -157,12 +157,12 @@ def main():
                     lse=torch.full_like(lse_ref, float("nan")),
                 )
                 kittie(**tk_inputs)
-                # torch.testing.assert_close(
-                #     tk_inputs["out"], out_ref, rtol=1e-2, atol=1e-2
-                # )
-                # torch.testing.assert_close(
-                #     tk_inputs["lse"], lse_ref, rtol=1e-3, atol=1e-3
-                # )
+                torch.testing.assert_close(
+                    tk_inputs["out"], out_ref, rtol=1e-2, atol=1e-2
+                )
+                torch.testing.assert_close(
+                    tk_inputs["lse"], lse_ref, rtol=1e-3, atol=1e-3
+                )
             if debug:
                 torch_stream.synchronize()
                 print(
