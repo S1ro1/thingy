@@ -12,6 +12,12 @@ dependencies = [
 [project.scripts]
 cutie = "cutie:main"
 
+[project.optional-dependencies]
+attention = [
+    "apache-tvm-ffi==0.1.11",
+    "tilelang==0.1.12",
+]
+
 [[tool.uv.index]]
 url = "https://download.pytorch.org/whl/cu129"
 

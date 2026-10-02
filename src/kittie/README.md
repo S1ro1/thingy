@@ -1,5 +1,9 @@
 # Kittie
 
+`sparse_mla/` contains the [GLM-5.3 sparse-attention project](sparse_mla/README.md):
+a vendored Prime-RL TileLang baseline, packed-document workload suite, and empty
+TK kernel scaffold. Install its dependencies with `uv sync --extra attention`.
+
 ThunderKittens experiments alongside the CuTe kernels. Start in `gemm/gemm.cu`:
 the GEMM body is intentionally empty. The initial contract is contiguous BF16
 `A[M,K]`, `B[N,K]`, and `C[M,N]`, computing `C = A @ B.T`.
