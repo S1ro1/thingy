@@ -13,8 +13,9 @@ constexpr int HEADS = 64;
 constexpr int D_LATENT = 512, D_ROPE = 64, D_QK = D_LATENT + D_ROPE;
 constexpr int D_LATENT_TILED = 64;
 constexpr int TOPK = 2048;
-constexpr int NUM_WARPS = 8;
 constexpr int NUM_CONSUMER_WARPS = 4;
+constexpr int NUM_PRODUCER_WARPS = 4;
+constexpr int NUM_WARPS = NUM_CONSUMER_WARPS + NUM_PRODUCER_WARPS;
 constexpr int NUM_SMEM_STAGES = 2;
 constexpr int BK = 64;
 constexpr int NUM_INSTRUCTION_STAGES = D_LATENT / BK;
@@ -60,6 +61,11 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
 
     const int tidx = threadIdx.x;
     const int bidx = blockIdx.x;
+    const int laneidx = laneid();
+
+    const int kv_per_thread = 4;
+    const int kv_per_warp = KV_TOKENS_PER_MMA / NUM_PRODUCER_WARPS;
+    const int kv_threads_per_warp = KV_TOKENS_PER_MMA / kv_per_thread / NUM_PRODUCER_WARPS;
 
     auto &sQ_rope = salloc.allocate<globals::st_q_rope>();
     auto &sK_latent = salloc.allocate<globals::st_kv_latent, NUM_SMEM_STAGES, NUM_INSTRUCTION_STAGES>();
@@ -94,6 +100,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
         init_semaphore(o_ready, 0, 1);
         init_semaphore(q_tmem_ready, 0, 128);
 
+#pragma unroll
         for (int stage = 0; stage < NUM_SMEM_STAGES; ++stage) {
             init_semaphore(kv_empty[stage], 1, 0);
             init_semaphore(kv_rope_ready[stage], 0, 1);
@@ -133,10 +140,12 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
                 wait(kv_empty[smem_stage], smem_phase ^ 1);
             }
 
-            const int offset = bidx * TOPK + token_tile_idx * HEADS_PER_MMA + tidx * 4;
-            const int dst_row = tidx * 4;
             int4 indices4;
-            if (tidx < HEADS_PER_MMA / 4) {
+
+            const int dst_row = laneidx * 4 + warpid() * kv_per_warp;
+            const int offset = bidx * TOPK + token_tile_idx * KV_TOKENS_PER_MMA + dst_row;
+
+            if (laneidx < kv_threads_per_warp) {
                 indices4 = *reinterpret_cast<const int4 *>(g.indices.raw_ptr + offset);
 
                 sMask[smem_stage][dst_row] = indices4.x < g.q.depth() ? 0.f : -INFINITY;
@@ -154,7 +163,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
                     kittens::tma::expect_bytes(kv_ready[smem_stage][band], sizeof(globals::st_kv_latent));
                 }
                 warpgroup::sync(2);
-                if (tidx < KV_TOKENS_PER_MMA / 4) {
+                if (laneidx < kv_threads_per_warp) {
                     const int chunk_offset = band * 64;
 
                     ::tma::gather4(sK_latent[smem_stage][band].data + dst_row * 64, &g.kv_gather_map, kv_ready[smem_stage][band],
@@ -165,7 +174,8 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
                 kittens::tma::expect_bytes(kv_rope_ready[smem_stage], sizeof(globals::st_kv_rope));
             }
             warpgroup::sync(2);
-            if (tidx < KV_TOKENS_PER_MMA / 4) {
+            if (laneidx < kv_threads_per_warp) {
+
                 ::tma::gather4(sK_rope[smem_stage].data + dst_row * 64, &g.kv_gather_map, kv_rope_ready[smem_stage], D_LATENT, indices4);
             }
 
@@ -231,11 +241,31 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
             warpgroup::mul(l, l, alpha);
             warpgroup::row_sum(l, rp, l);
 
+            // alpha <= 1, so min(alpha) == 1 means every row is unchanged.
+            auto check_rescale = [&alpha, &tidx]() {
+                __shared__ int rescale_needed[NUM_CONSUMER_WARPS];
+                bool needs_rescale = false;
+                const bool warp_rescale = warp::min(alpha) != 1.0f;
+                if (!warp_rescale) {
+                    return needs_rescale;
+                }
+                if ((tidx & 31) == 0) {
+                    rescale_needed[tidx / 32] = warp_rescale;
+                }
+#pragma unroll
+                for (int warp = 0; warp < NUM_CONSUMER_WARPS; ++warp) {
+                    needs_rescale |= rescale_needed[warp] != 0;
+                }
+                return needs_rescale;
+            };
+
             warpgroup::store(sP, rp);
             warpgroup::sync(1);
 
+            auto needs_rescale = check_rescale();
+
             globals::rt_o rescale_out;
-            if (token_tile_idx > 0) {
+            if (token_tile_idx > 0 && needs_rescale) {
                 for (int chunk_idx = 0; chunk_idx < D_LATENT / D_LATENT_TILED; ++chunk_idx) {
                     auto tChunk = tO.subtile<globals::tt_o_chunk>(0, chunk_idx * D_LATENT_TILED);
                     warpgroup::load_async(rescale_out, tChunk);
