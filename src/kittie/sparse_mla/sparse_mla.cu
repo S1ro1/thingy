@@ -19,14 +19,15 @@ constexpr int NUM_WARPS = NUM_CONSUMER_WARPS + NUM_PRODUCER_WARPS;
 constexpr int NUM_SMEM_STAGES = 2;
 constexpr int BK = 64;
 constexpr int NUM_INSTRUCTION_STAGES = D_LATENT / BK;
+constexpr int BN_PV = 256;
 
 __device__ constexpr float SM_SCALE = 1.0f / 16.0f;
 
 struct globals {
-    using st_q_latent = st_bf<HEADS_PER_MMA, BK>;
-    using st_kv_latent = st_bf<HEADS_PER_MMA, BK>;
+    using st_q_latent = st_bf<HEADS_PER_MMA, BK, true, 128>;
+    using st_kv_latent = st_bf<KV_TOKENS_PER_MMA, D_LATENT>;
     using st_q_rope = st_bf<HEADS_PER_MMA, D_ROPE>;
-    using st_kv_rope = st_bf<HEADS_PER_MMA, D_ROPE>;
+    using st_kv_rope = st_bf<KV_TOKENS_PER_MMA, D_ROPE>;
     using st_p = st_bf<HEADS_PER_MMA, KV_TOKENS_PER_MMA>;
 
     using rt_p = rt<float, HEADS_PER_MMA / NUM_CONSUMER_WARPS, KV_TOKENS_PER_MMA>;
@@ -68,7 +69,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
     const int kv_threads_per_warp = KV_TOKENS_PER_MMA / kv_per_thread / NUM_PRODUCER_WARPS;
 
     auto &sQ_rope = salloc.allocate<globals::st_q_rope>();
-    auto &sK_latent = salloc.allocate<globals::st_kv_latent, NUM_SMEM_STAGES, NUM_INSTRUCTION_STAGES>();
+    auto &sK_latent = salloc.allocate<globals::st_kv_latent, NUM_SMEM_STAGES>();
     auto &sK_rope = salloc.allocate<globals::st_kv_rope, NUM_SMEM_STAGES>();
     auto &sMask = salloc.allocate<sv_fl<HEADS_PER_MMA>, NUM_SMEM_STAGES>();
     auto &sP = salloc.allocate<globals::st_p>();
@@ -116,7 +117,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
             kittens::tma::expect_bytes(q_smem_ready, sizeof(globals::st_q_latent) * NUM_INSTRUCTION_STAGES + sizeof(globals::st_q_rope));
             // q to smem
             for (int instruction_idx = 0; instruction_idx < NUM_INSTRUCTION_STAGES; ++instruction_idx) {
-                kittens::tma::load_async(sK_latent[1][instruction_idx], g.q, coord<>{0, bidx, 0, instruction_idx * BK},
+                kittens::tma::load_async(sK_latent[1].subtile<BK>(instruction_idx), g.q, coord<>{0, bidx, 0, instruction_idx * BK},
                                          q_smem_ready); // coord<> so we get global coordinates
             }
             kittens::tma::load_async(sQ_rope, g.q, coord<>{0, bidx, 0, D_LATENT}, q_smem_ready);
@@ -125,7 +126,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
 
         // q to tmem
         for (int chunk_idx = 0; chunk_idx < 8; ++chunk_idx) {
-            auto &sChunk = sK_latent[1][chunk_idx];
+            auto &sChunk = sK_latent[1].subtile<BK>(chunk_idx);
             auto tChunk = tQ_latent.subtile<tt_bf<HEADS_PER_MMA, D_LATENT_TILED>>(0, chunk_idx * D_LATENT_TILED);
             rt_bf<16, 64> rQ;
             warpgroup::load(rQ, sChunk);
@@ -160,14 +161,14 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
 
             for (int band = 0; band < D_LATENT / 64; ++band) {
                 if (tidx == 0) {
-                    kittens::tma::expect_bytes(kv_ready[smem_stage][band], sizeof(globals::st_kv_latent));
+                    kittens::tma::expect_bytes(kv_ready[smem_stage][band], sizeof(st_bf<KV_TOKENS_PER_MMA, BK>));
                 }
                 warpgroup::sync(2);
                 if (laneidx < kv_threads_per_warp) {
                     const int chunk_offset = band * 64;
 
-                    ::tma::gather4(sK_latent[smem_stage][band].data + dst_row * 64, &g.kv_gather_map, kv_ready[smem_stage][band],
-                                   chunk_offset, indices4);
+                    ::tma::gather4(sK_latent[smem_stage].subtile<BK>(band).data + dst_row * 64, &g.kv_gather_map,
+                                   kv_ready[smem_stage][band], chunk_offset, indices4);
                 }
             }
             if (tidx == 0) {
@@ -202,9 +203,9 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
                 if (tidx == 0) {
                     wait(kv_ready[smem_stage][instruction_idx], smem_phase);
                     if (instruction_idx == 0) {
-                        kittens::mm_ABt(tP, tQ_latent_chunk, sK_latent[smem_stage][instruction_idx]);
+                        kittens::mm_ABt(tP, tQ_latent_chunk, sK_latent[smem_stage].subtile<BK>(instruction_idx));
                     } else {
-                        kittens::mma_ABt(tP, tQ_latent_chunk, sK_latent[smem_stage][instruction_idx]);
+                        kittens::mma_ABt(tP, tQ_latent_chunk, sK_latent[smem_stage].subtile<BK>(instruction_idx));
                     }
                 }
             }
@@ -244,14 +245,14 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
             // alpha <= 1, so min(alpha) == 1 means every row is unchanged.
             auto check_rescale = [&alpha, &tidx]() {
                 __shared__ int rescale_needed[NUM_CONSUMER_WARPS];
-                bool needs_rescale = false;
+
                 const bool warp_rescale = warp::min(alpha) != 1.0f;
-                if (!warp_rescale) {
-                    return needs_rescale;
-                }
                 if ((tidx & 31) == 0) {
                     rescale_needed[tidx / 32] = warp_rescale;
                 }
+                warpgroup::sync(1);
+
+                bool needs_rescale = false;
 #pragma unroll
                 for (int warp = 0; warp < NUM_CONSUMER_WARPS; ++warp) {
                     needs_rescale |= rescale_needed[warp] != 0;
@@ -281,14 +282,14 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
             tensor_after_thread_sync();
 
 #pragma unroll
-            for (int instruction_idx = 0; instruction_idx < NUM_INSTRUCTION_STAGES; ++instruction_idx) {
-                auto &sK_latent_chunk = sK_latent[smem_stage][instruction_idx];
-                auto tO_chunk = tO.subtile<tt<float, HEADS_PER_MMA, BK>>(0, instruction_idx * BK);
+            for (int instruction_idx = 0; instruction_idx < D_LATENT / BN_PV; ++instruction_idx) {
+                auto &sV_latent_chunk = sK_latent[smem_stage].subtile<BN_PV>(instruction_idx);
+                auto tO_chunk = tO.subtile<tt<float, HEADS_PER_MMA, BN_PV>>(0, instruction_idx * BN_PV);
                 if (tidx == 0) {
                     if (token_tile_idx == 0) {
-                        kittens::mm_AB(tO_chunk, sP, sK_latent_chunk);
+                        kittens::mm_AB(tO_chunk, sP, sV_latent_chunk);
                     } else {
-                        kittens::mma_AB(tO_chunk, sP, sK_latent_chunk);
+                        kittens::mma_AB(tO_chunk, sP, sV_latent_chunk);
                     }
                 }
             }
