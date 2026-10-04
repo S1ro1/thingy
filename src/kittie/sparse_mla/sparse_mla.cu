@@ -18,7 +18,7 @@ constexpr int NUM_PRODUCER_WARPS = 4;
 constexpr int NUM_WARPS = NUM_CONSUMER_WARPS + NUM_PRODUCER_WARPS;
 constexpr int NUM_SMEM_STAGES = 2;
 constexpr int BK = 64;
-constexpr int NUM_INSTRUCTION_STAGES = D_LATENT / BK;
+constexpr int NUM_MMAS = D_LATENT / BK;
 constexpr int BN_PV = 256;
 
 __device__ constexpr float SM_SCALE = 1.0f / 16.0f;
@@ -80,7 +80,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
 
     __shared__ semaphore q_smem_ready;
     __shared__ semaphore q_tmem_ready;
-    __shared__ semaphore kv_ready[NUM_SMEM_STAGES][NUM_INSTRUCTION_STAGES];
+    __shared__ semaphore kv_ready[NUM_SMEM_STAGES][NUM_MMAS];
     __shared__ semaphore kv_rope_ready[NUM_SMEM_STAGES];
     __shared__ semaphore p_ready;
     __shared__ semaphore o_ready;
@@ -95,17 +95,17 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
     tile_max = -INFINITY;
     l = 0.f;
 
-    if (threadIdx.x == 0) {
+    if (tidx == 0) {
         init_semaphore(q_smem_ready, 0, 1);
         init_semaphore(p_ready, 0, 1);
         init_semaphore(o_ready, 0, 1);
         init_semaphore(q_tmem_ready, 0, 128);
 
-#pragma unroll
+        #pragma unroll
         for (int stage = 0; stage < NUM_SMEM_STAGES; ++stage) {
             init_semaphore(kv_empty[stage], 1, 0);
             init_semaphore(kv_rope_ready[stage], 0, 1);
-            for (int instruction_idx = 0; instruction_idx < NUM_INSTRUCTION_STAGES; ++instruction_idx) {
+            for (int instruction_idx = 0; instruction_idx < NUM_MMAS; ++instruction_idx) {
                 init_semaphore(kv_ready[stage][instruction_idx], 0, 1);
             }
         }
@@ -114,10 +114,10 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
 
     if (warpgroup::groupid() == 0) {
         if (tidx == 0) {
-            kittens::tma::expect_bytes(q_smem_ready, sizeof(globals::st_q_latent) * NUM_INSTRUCTION_STAGES + sizeof(globals::st_q_rope));
+            kittens::tma::expect_bytes(q_smem_ready, sizeof(globals::st_q_latent) * NUM_MMAS + sizeof(globals::st_q_rope));
             // q to smem
-            for (int instruction_idx = 0; instruction_idx < NUM_INSTRUCTION_STAGES; ++instruction_idx) {
-                kittens::tma::load_async(sK_latent[1].subtile<BK>(instruction_idx), g.q, coord<>{0, bidx, 0, instruction_idx * BK},
+            for (int chunk_idx = 0; chunk_idx < NUM_MMAS; ++chunk_idx) {
+                kittens::tma::load_async(sK_latent[1].subtile<BK>(chunk_idx), g.q, coord<>{0, bidx, 0, chunk_idx * BK},
                                          q_smem_ready); // coord<> so we get global coordinates
             }
             kittens::tma::load_async(sQ_rope, g.q, coord<>{0, bidx, 0, D_LATENT}, q_smem_ready);
@@ -126,57 +126,53 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
 
         // q to tmem
         for (int chunk_idx = 0; chunk_idx < 8; ++chunk_idx) {
-            auto &sChunk = sK_latent[1].subtile<BK>(chunk_idx);
-            auto tChunk = tQ_latent.subtile<tt_bf<HEADS_PER_MMA, D_LATENT_TILED>>(0, chunk_idx * D_LATENT_TILED);
+            auto &smem_q_chunked = sK_latent[1].subtile<BK>(chunk_idx);
+            auto tmem_q_chunked = tQ_latent.subtile<tt_bf<HEADS_PER_MMA, D_LATENT_TILED>>(0, chunk_idx * D_LATENT_TILED);
             rt_bf<16, 64> rQ;
-            warpgroup::load(rQ, sChunk);
-            warpgroup::store_async(tChunk, rQ);
+            warpgroup::load(rQ, smem_q_chunked);
+            warpgroup::store_async(tmem_q_chunked, rQ);
         }
 
         for (int token_tile_idx = 0; token_tile_idx < TOPK / KV_TOKENS_PER_MMA; ++token_tile_idx) {
+            if (g.indices.raw_ptr[bidx * TOPK + token_tile_idx * KV_TOKENS_PER_MMA] >= g.q.depth())
+                break;
+
             const int smem_stage = token_tile_idx % NUM_SMEM_STAGES;
             const int smem_phase = (token_tile_idx / NUM_SMEM_STAGES) & 1;
+
+            int4 indices4;
 
             if (token_tile_idx >= NUM_SMEM_STAGES) {
                 wait(kv_empty[smem_stage], smem_phase ^ 1);
             }
-
-            int4 indices4;
 
             const int dst_row = laneidx * 4 + warpid() * kv_per_warp;
             const int offset = bidx * TOPK + token_tile_idx * KV_TOKENS_PER_MMA + dst_row;
 
             if (laneidx < kv_threads_per_warp) {
                 indices4 = *reinterpret_cast<const int4 *>(g.indices.raw_ptr + offset);
-
                 sMask[smem_stage][dst_row] = indices4.x < g.q.depth() ? 0.f : -INFINITY;
                 sMask[smem_stage][dst_row + 1] = indices4.y < g.q.depth() ? 0.f : -INFINITY;
                 sMask[smem_stage][dst_row + 2] = indices4.z < g.q.depth() ? 0.f : -INFINITY;
                 sMask[smem_stage][dst_row + 3] = indices4.w < g.q.depth() ? 0.f : -INFINITY;
             }
 
-            // On tile 0 this also ensures all producer warps finished reading
-            // Q from stage 1 before any later iteration can reuse that stage.
-            warpgroup::sync(2);
-
-            for (int band = 0; band < D_LATENT / 64; ++band) {
-                if (tidx == 0) {
+            if (tidx == 0) {
+                kittens::tma::expect_bytes(kv_rope_ready[smem_stage], sizeof(globals::st_kv_rope));
+                #pragma unroll
+                for (int band = 0; band < D_LATENT / 64; ++band) {
                     kittens::tma::expect_bytes(kv_ready[smem_stage][band], sizeof(st_bf<KV_TOKENS_PER_MMA, BK>));
                 }
-                warpgroup::sync(2);
-                if (laneidx < kv_threads_per_warp) {
-                    const int chunk_offset = band * 64;
+            }
+            warpgroup::sync(2);
 
+            if (laneidx < kv_threads_per_warp) {
+                #pragma unroll
+                for (int band = 0; band < D_LATENT / 64; ++band) {
+                    const int chunk_offset = band * 64;
                     ::tma::gather4(sK_latent[smem_stage].subtile<BK>(band).data + dst_row * 64, &g.kv_gather_map,
                                    kv_ready[smem_stage][band], chunk_offset, indices4);
                 }
-            }
-            if (tidx == 0) {
-                kittens::tma::expect_bytes(kv_rope_ready[smem_stage], sizeof(globals::st_kv_rope));
-            }
-            warpgroup::sync(2);
-            if (laneidx < kv_threads_per_warp) {
-
                 ::tma::gather4(sK_rope[smem_stage].data + dst_row * 64, &g.kv_gather_map, kv_rope_ready[smem_stage], D_LATENT, indices4);
             }
 
@@ -187,25 +183,27 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
                 tensor_after_thread_sync();
             }
         }
-    }
-    if (warpgroup::groupid() == 1) {
+    } else if (warpgroup::groupid() == 1) {
         const int tidx = warpgroup::laneid();
         wait(q_tmem_ready, 0);
         tensor_after_thread_sync();
         for (int token_tile_idx = 0; token_tile_idx < TOPK / HEADS_PER_MMA; ++token_tile_idx) {
+            if (g.indices.raw_ptr[bidx * TOPK + token_tile_idx * KV_TOKENS_PER_MMA] >= g.q.depth())
+                break;
+
             const int smem_stage = token_tile_idx % NUM_SMEM_STAGES;
             const int smem_phase = (token_tile_idx / NUM_SMEM_STAGES) & 1;
 
             globals::rt_p::row_vec rMask;
 
-            for (int instruction_idx = 0; instruction_idx < NUM_INSTRUCTION_STAGES; ++instruction_idx) {
-                auto tQ_latent_chunk = tQ_latent.subtile<tt_bf<HEADS_PER_MMA, BK>>(0, instruction_idx * BK);
+            for (int mma_idx = 0; mma_idx < NUM_MMAS; ++mma_idx) {
+                auto tQ_latent_chunk = tQ_latent.subtile<tt_bf<HEADS_PER_MMA, BK>>(0, mma_idx * BK);
                 if (tidx == 0) {
-                    wait(kv_ready[smem_stage][instruction_idx], smem_phase);
-                    if (instruction_idx == 0) {
-                        kittens::mm_ABt(tP, tQ_latent_chunk, sK_latent[smem_stage].subtile<BK>(instruction_idx));
+                    wait(kv_ready[smem_stage][mma_idx], smem_phase);
+                    if (mma_idx == 0) {
+                        kittens::mm_ABt(tP, tQ_latent_chunk, sK_latent[smem_stage].subtile<BK>(mma_idx));
                     } else {
-                        kittens::mma_ABt(tP, tQ_latent_chunk, sK_latent[smem_stage].subtile<BK>(instruction_idx));
+                        kittens::mma_ABt(tP, tQ_latent_chunk, sK_latent[smem_stage].subtile<BK>(mma_idx));
                     }
                 }
             }
@@ -253,7 +251,7 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
                 warpgroup::sync(1);
 
                 bool needs_rescale = false;
-#pragma unroll
+                #pragma unroll
                 for (int warp = 0; warp < NUM_CONSUMER_WARPS; ++warp) {
                     needs_rescale |= rescale_needed[warp] != 0;
                 }
@@ -281,10 +279,10 @@ __global__ __launch_bounds__(NUM_WARPS * 32) void sparse_mla(const __grid_consta
             warpgroup::sync(1);
             tensor_after_thread_sync();
 
-#pragma unroll
-            for (int instruction_idx = 0; instruction_idx < D_LATENT / BN_PV; ++instruction_idx) {
-                auto &sV_latent_chunk = sK_latent[smem_stage].subtile<BN_PV>(instruction_idx);
-                auto tO_chunk = tO.subtile<tt<float, HEADS_PER_MMA, BN_PV>>(0, instruction_idx * BN_PV);
+            #pragma unroll
+            for (int mma_idx = 0; mma_idx < D_LATENT / BN_PV; ++mma_idx) {
+                auto &sV_latent_chunk = sK_latent[smem_stage].subtile<BN_PV>(mma_idx);
+                auto tO_chunk = tO.subtile<tt<float, HEADS_PER_MMA, BN_PV>>(0, mma_idx * BN_PV);
                 if (tidx == 0) {
                     if (token_tile_idx == 0) {
                         kittens::mm_AB(tO_chunk, sP, sV_latent_chunk);
